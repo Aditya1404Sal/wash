@@ -30,7 +30,7 @@ use hyper::server::conn::http1;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use wasmtime::component::InstancePre;
-use wasmtime::{AsContextMut, StoreContextMut};
+use wasmtime::{StoreContextMut};
 use wasmtime_wasi_http::{
     WasiHttpView,
     bindings::{ProxyPre, http::types::Scheme},
@@ -412,6 +412,12 @@ async fn handle_http_request(
 }
 
 /// Invoke the component handler for the given workload
+/// 
+/// This function handles both streaming and non-streaming responses:
+/// - For non-streaming: Component sets full response, returns immediately
+/// - For streaming: Component sets headers, continues streaming body in background
+/// 
+/// The Store MUST be kept alive for the entire streaming duration.
 async fn invoke_component_handler(
     workload_handle: ResolvedWorkload,
     instance_pre: InstancePre<Ctx>,
@@ -421,7 +427,52 @@ async fn invoke_component_handler(
     // Create a new store for this request with plugin contexts
     let mut store = workload_handle.new_store(component_id).await?;
 
-    handle_component_request(store.as_context_mut(), instance_pre, req).await
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let scheme = match req.uri().scheme() {
+        Some(scheme) if scheme == &hyper::http::uri::Scheme::HTTP => Scheme::Http,
+        Some(scheme) if scheme == &hyper::http::uri::Scheme::HTTPS => Scheme::Https,
+        Some(scheme) => Scheme::Other(scheme.as_str().to_string()),
+        None => Scheme::Http,
+    };
+    let req = store.data_mut().new_incoming_request(scheme, req)?;
+    let out = store.data_mut().new_response_outparam(sender)?;
+    let pre = ProxyPre::new(instance_pre).context("failed to instantiate proxy pre")?;
+
+    let proxy = pre.instantiate_async(&mut store).await?;
+
+    // Spawn task that owns the store - this keeps it alive for both:
+    // - Non-streaming: until response is fully prepared
+    // - Streaming: until all body chunks are sent
+    tokio::spawn(async move {
+        if let Err(e) = proxy
+            .wasi_http_incoming_handler()
+            .call_handle(&mut store, req, out)
+            .await
+        {
+            error!(err = ?e, "component handler error");
+        }
+        // Store is dropped here, after component finishes
+        // For non-streaming: happens immediately after setting response
+        // For streaming: happens after all body chunks are written
+    });
+
+    // Wait for the response to be set (headers + body handle)
+    // - Non-streaming: response contains full body
+    // - Streaming: response contains body stream, data flows asynchronously
+    match receiver.await {
+        Ok(Ok(resp)) => {
+            // Response is ready, body may still be streaming
+            // HyperOutgoingBody handles async streaming automatically
+            Ok(resp)
+        }
+        Ok(Err(e)) => Err(e.into()),
+        Err(e) => {
+            error!(err = ?e, "error receiving http response");
+            Err(anyhow::anyhow!(
+                "oneshot channel closed but no response was sent"
+            ))
+        }
+    }
 }
 
 /// Handle a component request using WASI HTTP (copied from wash/crates/src/cli/dev.rs)
