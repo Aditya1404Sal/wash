@@ -1,3 +1,6 @@
+#[cfg(feature = "grpc")]
+use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,6 +37,8 @@ pub struct ClusterHostBuilder {
     host_group: Option<String>,
     host_name: Option<String>,
     heartbeat_interval: Option<Duration>,
+    #[cfg(feature = "grpc")]
+    grpc_config: Option<HashMap<String, String>>,
 }
 
 impl ClusterHostBuilder {
@@ -54,6 +59,12 @@ impl ClusterHostBuilder {
 
     pub fn with_nats_client(mut self, nats_client: Arc<async_nats::Client>) -> Self {
         self.nats_client = Some(nats_client);
+        self
+    }
+
+    #[cfg(feature = "grpc")]
+    pub fn with_grpc(mut self, config: HashMap<String, String>) -> Self {
+        self.grpc_config = Some(config);
         self
     }
 
@@ -99,12 +110,6 @@ pub struct ClusterHost {
     prepared_host: Host,
     nats_client: Arc<async_nats::Client>,
     heartbeat_interval: Duration,
-}
-
-impl ClusterHost {
-    pub fn host(&self) -> &Host {
-        &self.prepared_host
-    }
 }
 
 pub async fn run_cluster_host(
@@ -316,7 +321,15 @@ async fn workload_start(
     };
 
     let service = if let Some(service) = service {
-        let oci_config = image_pull_secret_to_oci_config(&service.image_pull_secret);
+        let use_insecure = env::var("USE_INSECURE_OCI")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        let oci_config = if use_insecure {
+            oci::OciConfig::new_insecure()
+        } else {
+            image_pull_secret_to_oci_config(&service.image_pull_secret)
+        };
         let bytes = match oci::pull_component(&service.image, oci_config).await {
             Ok(bytes) => bytes,
             Err(e) => {

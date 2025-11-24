@@ -25,7 +25,12 @@ use crate::engine::workload::ResolvedWorkload;
 use crate::wit::WitInterface;
 use anyhow::{Context, ensure};
 use hyper::server::conn::http1;
+use hyper_util::rt::TokioIo;
+use rustls::{ServerConfig, pki_types::CertificateDer};
+use rustls_pemfile::{certs, private_key};
 use tokio::net::TcpListener;
+use tokio::sync::{RwLock, mpsc};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 use wasmtime::component::InstancePre;
 use wasmtime::{AsContextMut, StoreContextMut};
@@ -33,13 +38,7 @@ use wasmtime_wasi_http::{
     WasiHttpView,
     bindings::{ProxyPre, http::types::Scheme},
     body::HyperOutgoingBody,
-    io::TokioIo,
 };
-
-use rustls::{ServerConfig, pki_types::CertificateDer};
-use rustls_pemfile::{certs, private_key};
-use tokio::sync::{RwLock, mpsc};
-use tokio_rustls::TlsAcceptor;
 
 /// Trait defining the routing behavior for HTTP requests
 /// Allows for custom routing logic based on workload IDs and requests
@@ -433,6 +432,27 @@ impl<T: Router> HostHandler for HttpServer<T> {
 
         // NOTE(lxf): Bring wasi-http code if needed
         // Separate HTTP / GRPC handling
+        let is_grpc = request
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.starts_with("application/grpc"))
+            .unwrap_or(false);
+
+        // Route to appropriate client plugin
+        if is_grpc {
+            #[cfg(feature = "grpc")]
+            {
+                return crate::grpc::send_request(request, config);
+            }
+            #[cfg(not(feature = "grpc"))]
+            {
+                return Err(wasmtime_wasi_http::HttpError::trap(anyhow::anyhow!(
+                    "gRPC requests are not supported. Please enable the 'grpc' feature."
+                )));
+            }
+        }
+
         Ok(wasmtime_wasi_http::types::default_send_request(
             request, config,
         ))
@@ -565,7 +585,6 @@ async fn handle_http_request<T: Router>(
                 .expect("failed to build 404 response")
         }
     };
-
     Ok(response)
 }
 
