@@ -25,6 +25,8 @@ fn main() {
         env::var("OUT_DIR").expect("failed to look up `OUT_DIR` from environment variables"),
     );
     let workspace_dir = workspace_dir().expect("failed to get workspace dir");
+    println!("cargo:rerun-if-changed=tests/proto");
+    println!("cargo:rerun-if-changed=proto");
     let top_proto_dir = workspace_dir.join("proto");
     let proto_dir = top_proto_dir.join("wasmcloud/runtime/v2");
 
@@ -58,15 +60,15 @@ fn main() {
     }
 
     // Compile test proto files if they exist
-    let test_proto_file = workspace_dir.join("tests/proto/helloworld.proto");
-    if test_proto_file.exists() {
-        println!("cargo:rerun-if-changed={}", test_proto_file.display());
+    let crate_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let test_proto_file = crate_dir.join("tests/proto/helloworld.proto");
 
-        tonic_prost_build::configure()
-            .build_client(false)
-            .build_server(true)
-            .build_transport(true)
-            .compile_protos(&[&test_proto_file], &[&workspace_dir.join("tests/proto")])
-            .expect("failed to compile test protos");
-    }
+    println!("cargo:rerun-if-changed={}", test_proto_file.display());
+
+    tonic_prost_build::configure()
+        .build_client(false)
+        .build_server(true)
+        .build_transport(true)
+        .compile_protos(&[&test_proto_file], &[&crate_dir.join("tests/proto")])
+        .expect("failed to compile test protos");
 }

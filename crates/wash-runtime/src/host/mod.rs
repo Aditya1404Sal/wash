@@ -59,6 +59,7 @@ mod sysinfo;
 use sysinfo::SystemMonitor;
 
 pub mod http;
+pub mod transport;
 
 /// The API for interacting with a wasmcloud host.
 ///
@@ -603,8 +604,8 @@ pub struct HostConfig {
 }
 
 /// Builder for the [`Host`]
-#[derive(Default)]
 pub struct HostBuilder {
+    id: String,
     engine: Option<Engine>,
     plugins: HashMap<&'static str, Arc<dyn HostPlugin>>,
     hostname: Option<String>,
@@ -634,6 +635,10 @@ impl HostBuilder {
         Self::default()
     }
 
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn with_engine(mut self, engine: Engine) -> Self {
         self.engine = Some(engine);
         self
@@ -642,12 +647,6 @@ impl HostBuilder {
     /// Overrides the default HTTP handler.
     pub fn with_http_handler(mut self, handler: Arc<dyn crate::host::http::HostHandler>) -> Self {
         self.http_handler = Some(handler);
-        self
-    }
-
-    #[cfg(feature = "grpc")]
-    pub fn with_grpc(mut self, config: HashMap<String, String>) -> Self {
-        self.grpc_config = Some(config);
         self
     }
 
@@ -662,6 +661,7 @@ impl HostBuilder {
         self.plugins.insert(plugin_id, plugin);
         Ok(self)
     }
+
     /// Sets the hostname for this host.
     ///
     /// # Arguments
@@ -721,11 +721,6 @@ impl HostBuilder {
     /// # Errors
     /// Returns an error if the default engine cannot be created (when no engine is provided).
     pub fn build(self) -> anyhow::Result<Host> {
-        #[cfg(feature = "grpc")]
-        if let Some(config) = self.grpc_config {
-            crate::grpc::init_grpc(&config)?;
-        }
-
         let engine = if let Some(engine) = self.engine {
             engine
         } else {
@@ -758,7 +753,7 @@ impl HostBuilder {
             engine,
             workloads: Arc::default(),
             plugins: self.plugins,
-            id: uuid::Uuid::new_v4().to_string(),
+            id: self.id,
             hostname,
             friendly_name,
             version: env!("CARGO_PKG_VERSION").to_string(),

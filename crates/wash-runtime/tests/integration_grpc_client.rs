@@ -28,6 +28,8 @@ use wash_runtime::{
     wit::WitInterface,
 };
 
+use wash_runtime::host::transport::CompositeOutgoingHandler;
+
 const GRPC_HELLO_WORLD_WASM: &[u8] = include_bytes!("fixtures/grpc_hello_world.wasm");
 
 // gRPC service definition
@@ -145,14 +147,17 @@ async fn test_grpc_client_basic() -> Result<()> {
     // Create HTTP server plugin on a dynamically allocated port
     let port = find_available_port().await?;
     let http_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let http_handler = DevRouter::default();
-    let http_plugin = HttpServer::new(http_handler, http_addr);
 
-    // Build host with plugins
+    let outgoing = CompositeOutgoingHandler::new().with_grpc(HashMap::new())?;
+
+    // Create HTTP server with outgoing handlers
+    let http_handler = DevRouter::default();
+    let http_plugin = HttpServer::with_outgoing_handler(http_handler, http_addr, outgoing);
+
+    // Build host (clean!)
     let host = HostBuilder::new()
         .with_engine(engine.clone())
         .with_http_handler(Arc::new(http_plugin))
-        .with_grpc(HashMap::new())
         .build()?;
 
     let host = host.start().await.context("Failed to start host")?;
@@ -260,8 +265,12 @@ async fn test_grpc_client_concurrent() -> Result<()> {
 
     let http_port = find_available_port().await?;
     let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
+
+    let outgoing = CompositeOutgoingHandler::new().with_grpc(HashMap::new())?;
+
+    // Create HTTP server with outgoing handlers
     let http_handler = DevRouter::default();
-    let http_plugin = HttpServer::new(http_handler, http_addr);
+    let http_plugin = HttpServer::with_outgoing_handler(http_handler, http_addr, outgoing);
 
     let engine = Engine::builder().build()?;
 
@@ -270,7 +279,6 @@ async fn test_grpc_client_concurrent() -> Result<()> {
         .with_plugin(Arc::new(WasiLogging {}))?
         .with_plugin(Arc::new(WasiConfig::default()))?
         .with_http_handler(Arc::new(http_plugin))
-        .with_grpc(HashMap::new())
         .build()?;
 
     let host = host.start().await.context("Failed to start host")?;
@@ -338,17 +346,20 @@ async fn test_grpc_client_error_handling() -> Result<()> {
 
     let http_port = find_available_port().await?;
     let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
-    let http_handler = DevRouter::default();
-    let http_plugin = HttpServer::new(http_handler, http_addr);
 
     let engine = Engine::builder().build()?;
+
+    let outgoing = CompositeOutgoingHandler::new().with_grpc(HashMap::new())?;
+
+    // Create HTTP server with outgoing handlers
+    let http_handler = DevRouter::default();
+    let http_plugin = HttpServer::with_outgoing_handler(http_handler, http_addr, outgoing);
 
     let host = HostBuilder::new()
         .with_engine(engine.clone())
         .with_plugin(Arc::new(WasiLogging {}))?
         .with_plugin(Arc::new(WasiConfig::default()))?
         .with_http_handler(Arc::new(http_plugin))
-        .with_grpc(HashMap::new())
         .build()?;
 
     let host = host.start().await.context("Failed to start host")?;
