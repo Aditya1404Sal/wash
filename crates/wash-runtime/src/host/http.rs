@@ -66,20 +66,24 @@ pub trait Router: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 
     /// Pick a workload ID based on the incoming request
-    fn route_incoming_request(
+    async fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String>;
 }
 
-/// Router that routes requests by 'Host' header, configured via WitInterface config
+/// Router that routes requests by 'Host' header and optional path prefix, configured via WitInterface config
+/// Supports both host-only routing (backwards compatible) and (host, path) routing
 #[derive(Default)]
 pub struct DynamicRouter {
     host_to_workload: tokio::sync::RwLock<HashMap<String, String>>,
+    // Vec of (host, path-prefix, workload_id) for path-based routing
+    // it iss Stored as Vec to support longest prefix matching
+    path_to_workload: tokio::sync::RwLock<Vec<(String, String, String)>>,
 }
 
-/// Implementation of Router that maps Host headers to workload IDs
-/// based on the 'host' config in the wasi:http/incoming-handler interface
+/// Implementation of Router that maps Host headers and optional path prefixes to workload IDs
+/// based on the 'host' and optional 'path' config in the wasi:http/incoming-handler interface mapping
 #[async_trait::async_trait]
 impl Router for DynamicRouter {
     async fn on_workload_resolved(
@@ -102,15 +106,36 @@ impl Router for DynamicRouter {
             .cloned()
             .context("No host header found")?;
 
-        let mut lock = self.host_to_workload.write().await;
-        lock.insert(host_header, resolved_handle.id().to_string());
+        let workload_id = resolved_handle.id().to_string();
+
+        if let Some(path_prefix) = http_iface.config.get("path") {
+            // Store in path_to_workload for path-based routing
+            let mut path_lock = self.path_to_workload.write().await;
+            path_lock.push((
+                host_header.clone(),
+                path_prefix.clone(),
+                workload_id.clone(),
+            ));
+            debug!(host = %host_header, path = %path_prefix, workload_id = %workload_id,
+                   "Registered path-based route");
+        } else {
+            // Store in host_to_workload for host-only routing (backwards compatible)
+            let mut host_lock = self.host_to_workload.write().await;
+            host_lock.insert(host_header.clone(), workload_id.clone());
+            debug!(host = %host_header, workload_id = %workload_id,
+                   "Registered host-based route");
+        }
 
         Ok(())
     }
 
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
-        let mut lock = self.host_to_workload.write().await;
-        lock.retain(|_host, wid| wid != workload_id);
+        let mut host_lock = self.host_to_workload.write().await;
+        host_lock.retain(|_host, wid| wid != workload_id);
+
+        let mut path_lock = self.path_to_workload.write().await;
+        path_lock.retain(|(_host, _path, wid)| wid != workload_id);
+
         Ok(())
     }
 
@@ -124,22 +149,54 @@ impl Router for DynamicRouter {
     }
 
     /// Pick a workload ID based on the incoming request
-    fn route_incoming_request(
+    /// First tries (host, path) matching with longest prefix match
+    /// Falls back to host-only matching for backwards compatibility
+    async fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String> {
-        tokio::task::block_in_place(move || {
-            let lock = self.host_to_workload.try_read()?;
-            let workload_host = req
-                .headers()
-                .get(hyper::header::HOST)
-                .and_then(|h| h.to_str().ok())
-                .context("no Host header in request")?;
-            let Some(workload_id) = lock.get(workload_host) else {
-                anyhow::bail!("no workload bound to host header: {}", workload_host);
-            };
-            Ok(workload_id.clone())
-        })
+        let workload_host = req
+            .headers()
+            .get(hyper::header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .context("no Host header in request")?;
+
+        let request_path = req.uri().path();
+
+        // Try path-based routing first with longest prefix match
+        let path_lock = self.path_to_workload.read().await;
+        let mut best_match: Option<(usize, String)> = None; // (prefix_len, workload_id)
+
+        for (host, path_prefix, workload_id) in path_lock.iter() {
+            if host == workload_host && request_path.starts_with(path_prefix) {
+                let prefix_len = path_prefix.len();
+                if best_match.is_none() || prefix_len > best_match.as_ref().unwrap().0 {
+                    best_match = Some((prefix_len, workload_id.clone()));
+                }
+            }
+        }
+
+        if let Some((_, workload_id)) = best_match {
+            debug!(host = %workload_host, path = %request_path, workload_id = %workload_id,
+                   "Matched path-based route");
+            return Ok(workload_id);
+        }
+
+        drop(path_lock);
+
+        // Fall back to host-only routing
+        let host_lock = self.host_to_workload.read().await;
+        if let Some(workload_id) = host_lock.get(workload_host) {
+            debug!(host = %workload_host, workload_id = %workload_id,
+                   "Matched host-only route");
+            return Ok(workload_id.clone());
+        }
+
+        anyhow::bail!(
+            "no workload bound to host '{}' with path '{}'",
+            workload_host,
+            request_path
+        )
     }
 }
 
@@ -181,11 +238,11 @@ impl Router for DevRouter {
     }
 
     /// Pick a workload ID based on the incoming request
-    fn route_incoming_request(
+    async fn route_incoming_request(
         &self,
         _req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String> {
-        let lock = self.last_workload_id.try_lock()?;
+        let lock = self.last_workload_id.lock().await;
         match &*lock {
             Some(id) => Ok(id.clone()),
             None => anyhow::bail!("no workload available to route request"),
@@ -516,7 +573,7 @@ async fn handle_http_request<T: Router>(
     let method = req.method().clone();
     let uri = req.uri().clone();
 
-    let Ok(workload_id) = handler.route_incoming_request(&req) else {
+    let Ok(workload_id) = handler.route_incoming_request(&req).await else {
         return Ok(hyper::Response::builder()
             .status(400)
             .body(HyperOutgoingBody::default())
