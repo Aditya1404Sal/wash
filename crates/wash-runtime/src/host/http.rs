@@ -86,6 +86,7 @@ impl Router for DynamicRouter {
         resolved_handle: &ResolvedWorkload,
         _component_id: &str,
     ) -> anyhow::Result<()> {
+        info!("In workload resolved");
         let incoming_handler_interface = WitInterface::from("wasi:http/incoming-handler");
         let Some(http_iface) = resolved_handle
             .host_interfaces()
@@ -102,7 +103,16 @@ impl Router for DynamicRouter {
             .context("No host header found")?;
 
         let mut lock = self.host_to_workload.write().await;
-        lock.insert(host_header, resolved_handle.id().to_string());
+        lock.insert(host_header.clone(), resolved_handle.id().to_string());
+
+        info!("ADDED THIS TO HOST_TO_WORKLOAD");
+        info!(
+            "HOST HEADER: {} and ID: {}",
+            host_header,
+            resolved_handle.id().to_string()
+        );
+
+        info!("Out workload resolved");
 
         Ok(())
     }
@@ -127,16 +137,22 @@ impl Router for DynamicRouter {
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String> {
+        info!("In route incoming request");
         tokio::task::block_in_place(move || {
+            info!("In tokio task");
             let lock = self.host_to_workload.try_read()?;
+            info!("After lock   ");
             let workload_host = req
                 .headers()
                 .get(hyper::header::HOST)
                 .and_then(|h| h.to_str().ok())
                 .context("no Host header in request")?;
+            info!("After workload host   ");
             let Some(workload_id) = lock.get(workload_host) else {
+                info!("no workload bound to host header: {}", workload_host);
                 anyhow::bail!("no workload bound to host header: {}", workload_host);
             };
+            info!("Out route incoming request");
             Ok(workload_id.clone())
         })
     }
