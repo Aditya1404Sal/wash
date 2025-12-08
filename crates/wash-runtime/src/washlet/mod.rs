@@ -41,8 +41,6 @@ pub struct ClusterHostBuilder {
     host_name: Option<String>,
     heartbeat_interval: Option<Duration>,
     host_config: Option<HostConfig>,
-    #[cfg(feature = "grpc")]
-    grpc_config: Option<HashMap<String, String>>,
 }
 
 impl ClusterHostBuilder {
@@ -73,7 +71,7 @@ impl ClusterHostBuilder {
 
     #[cfg(feature = "grpc")]
     pub fn with_grpc(mut self, config: HashMap<String, String>) -> Self {
-        self.grpc_config = Some(config);
+        self.host_builder = self.host_builder.with_grpc(config);
         self
     }
 
