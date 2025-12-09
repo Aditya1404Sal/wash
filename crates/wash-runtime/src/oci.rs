@@ -243,20 +243,12 @@ impl CredentialResolver {
     /// Resolve credentials for a given registry
     #[instrument(skip(self), fields(registry = %registry))]
     async fn resolve_credentials(&self, registry: &str) -> RegistryAuth {
-        // First, try explicit credentials
-        if let Some((username, password)) = &self.explicit_credentials {
-            debug!("using explicit credentials");
-            return RegistryAuth::Basic(username.clone(), password.clone());
-        }
-
-        // Next, try docker credential helper
-        match self.get_docker_credentials(registry).await {
-            Ok(Some(auth)) => {
-                debug!("using docker credential helper");
-                return auth;
+        if registry.contains("bettywasmregistry") {
+            // First, try explicit credentials
+            if let Some((username, password)) = &self.explicit_credentials {
+                debug!("using explicit credentials");
+                return RegistryAuth::Basic(username.clone(), password.clone());
             }
-            Ok(None) => debug!("no docker credentials found"),
-            Err(e) => warn!(error = %e, "failed to retrieve docker credentials"),
         }
 
         // Fall back to anonymous

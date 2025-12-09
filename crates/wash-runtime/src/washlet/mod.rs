@@ -272,14 +272,25 @@ async fn handle_command(
 }
 
 /// Convert ImagePullSecret from protobuf to OciConfig
-fn image_pull_secret_to_oci_config(
+pub fn image_pull_secret_to_oci_config(
     config: &HostConfig,
     pull_secret: &Option<types::v2::ImagePullSecret>,
 ) -> oci::OciConfig {
     let mut oci_config = match &pull_secret {
         Some(creds) => oci::OciConfig::new_with_credentials(&creds.username, &creds.password),
-        None => OciConfig::default(),
+        None => {
+            let registry_username = env::var("REGISTRY_USERNAME");
+            let registry_password = env::var("REGISTRY_PASSWORD");
+
+            match (registry_username, registry_password) {
+                (Ok(username), Ok(password)) => {
+                    oci::OciConfig::new_with_credentials(&username, &password)
+                }
+                _ => OciConfig::default(),
+            }
+        }
     };
+
     oci_config.insecure = config.allow_oci_insecure;
     oci_config.timeout = config.oci_pull_timeout;
 
