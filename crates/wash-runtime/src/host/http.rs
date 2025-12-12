@@ -18,7 +18,12 @@
 //! 4. Managing the request/response lifecycle through WASI-HTTP
 //! ```
 
-use std::{collections::HashMap, net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+};
 
 use crate::engine::ctx::Ctx;
 use crate::engine::workload::ResolvedWorkload;
@@ -30,10 +35,11 @@ use rustls::{ServerConfig, pki_types::CertificateDer};
 use rustls_pemfile::{certs, private_key};
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, mpsc};
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
+use wasmtime::Store;
 use wasmtime::component::InstancePre;
-use wasmtime::{AsContextMut, StoreContextMut};
 use wasmtime_wasi_http::{
     WasiHttpView,
     bindings::{ProxyPre, http::types::Scheme},
@@ -74,7 +80,8 @@ pub trait Router: Send + Sync + 'static {
 /// Router that routes requests by 'Host' header, configured via WitInterface config
 #[derive(Default)]
 pub struct DynamicRouter {
-    host_to_workload: tokio::sync::RwLock<HashMap<String, String>>,
+    host_to_workload: tokio::sync::RwLock<HashMap<String, HashSet<String>>>,
+    workload_to_host: tokio::sync::RwLock<HashMap<String, String>>,
 }
 
 /// Implementation of Router that maps Host headers to workload IDs
@@ -102,9 +109,6 @@ impl Router for DynamicRouter {
             .cloned()
             .context("No host header found")?;
 
-        let mut lock = self.host_to_workload.write().await;
-        lock.insert(host_header.clone(), resolved_handle.id().to_string());
-
         info!("ADDED THIS TO HOST_TO_WORKLOAD");
         info!(
             "HOST HEADER: {} and ID: {}",
@@ -112,14 +116,32 @@ impl Router for DynamicRouter {
             resolved_handle.id().to_string()
         );
 
+        {
+            let mut lock = self.workload_to_host.write().await;
+            lock.insert(resolved_handle.id().to_string(), host_header.clone());
+        }
+
+        {
+            let mut lock = self.host_to_workload.write().await;
+            let entry = lock.entry(host_header.clone()).or_insert_with(HashSet::new);
+            entry.insert(resolved_handle.id().to_string());
+        }
         info!("Out workload resolved");
 
         Ok(())
     }
 
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
-        let mut lock = self.host_to_workload.write().await;
-        lock.retain(|_host, wid| wid != workload_id);
+        let mut lock = self.workload_to_host.write().await;
+        if let Some(host_header) = lock.remove(workload_id) {
+            let mut host_lock = self.host_to_workload.write().await;
+            if let Some(workload_set) = host_lock.get_mut(&host_header) {
+                workload_set.remove(workload_id);
+                if workload_set.is_empty() {
+                    host_lock.remove(&host_header);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -148,11 +170,17 @@ impl Router for DynamicRouter {
                 .and_then(|h| h.to_str().ok())
                 .context("no Host header in request")?;
             info!("After workload host   ");
-            let Some(workload_id) = lock.get(workload_host) else {
+            let Some(workload_set) = lock.get(workload_host) else {
                 info!("no workload bound to host header: {}", workload_host);
                 anyhow::bail!("no workload bound to host header: {}", workload_host);
             };
             info!("Out route incoming request");
+
+            let workload_id = workload_set
+                .iter()
+                .next()
+                .context("no workload IDs found for host header")?;
+
             Ok(workload_id.clone())
         })
     }
@@ -609,14 +637,14 @@ async fn invoke_component_handler(
     req: hyper::Request<hyper::body::Incoming>,
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
     // Create a new store for this request with plugin contexts
-    let mut store = workload_handle.new_store(component_id).await?;
+    let store = workload_handle.new_store(component_id).await?;
 
-    handle_component_request(store.as_context_mut(), instance_pre, req).await
+    handle_component_request(store, instance_pre, req).await
 }
 
 /// Handle a component request using WASI HTTP (copied from wash/crates/src/cli/dev.rs)
-pub async fn handle_component_request<'a>(
-    mut store: StoreContextMut<'a, Ctx>,
+pub async fn handle_component_request(
+    mut store: Store<Ctx>,
     pre: InstancePre<Ctx>,
     req: hyper::Request<hyper::body::Incoming>,
 ) -> anyhow::Result<hyper::Response<HyperOutgoingBody>> {
@@ -632,13 +660,20 @@ pub async fn handle_component_request<'a>(
     let out = store.data_mut().new_response_outparam(sender)?;
     let pre = ProxyPre::new(pre).context("failed to instantiate proxy pre")?;
 
-    // Run the http request itself by instantiating and calling the component
-    let proxy = pre.instantiate_async(&mut store).await?;
+    // Run the http request itself in a separate task so the task can
+    // optionally continue to execute beyond after the initial
+    // headers/response code are sent.
+    let task: JoinHandle<anyhow::Result<()>> = tokio::task::spawn(async move {
+        // Run the http request itself by instantiating and calling the component
+        let proxy = pre.instantiate_async(&mut store).await?;
 
-    proxy
-        .wasi_http_incoming_handler()
-        .call_handle(&mut store, req, out)
-        .await?;
+        proxy
+            .wasi_http_incoming_handler()
+            .call_handle(&mut store, req, out)
+            .await?;
+
+        Ok(())
+    });
 
     match receiver.await {
         // If the client calls `response-outparam::set` then one of these
@@ -649,10 +684,17 @@ pub async fn handle_component_request<'a>(
         // Otherwise the `sender` will get dropped along with the `Store`
         // meaning that the oneshot will get disconnected
         Err(e) => {
-            error!(err = ?e, "error receiving http response");
-            Err(anyhow::anyhow!(
-                "oneshot channel closed but no response was sent"
-            ))
+            if let Err(task_error) = task.await {
+                error!(err = ?task_error, "error receiving http response");
+                Err(anyhow::anyhow!(
+                    "error receiving http response: {task_error}"
+                ))
+            } else {
+                error!(err = ?e, "error receiving http response");
+                Err(anyhow::anyhow!(
+                    "oneshot channel closed but no response was sent"
+                ))
+            }
         }
     }
 }
