@@ -161,26 +161,29 @@ impl Router for DynamicRouter {
     ) -> anyhow::Result<String> {
         info!("In route incoming request");
         tokio::task::block_in_place(move || {
-            info!("In tokio task");
             let lock = self.host_to_workload.try_read()?;
-            info!("After lock   ");
+
+            info!("Out route incoming request");
+            info!("Host to workload map, {:?}", lock);
+
             let workload_host = req
                 .headers()
                 .get(hyper::header::HOST)
                 .and_then(|h| h.to_str().ok())
                 .context("no Host header in request")?;
-            info!("After workload host   ");
             let Some(workload_set) = lock.get(workload_host) else {
                 info!("no workload bound to host header: {}", workload_host);
                 anyhow::bail!("no workload bound to host header: {}", workload_host);
             };
-            info!("Out route incoming request");
 
             let workload_id = workload_set
                 .iter()
                 .next()
                 .context("no workload IDs found for host header")?;
 
+            info!("Go to workload_id: {}", workload_id.clone());
+
+            info!("Out route incoming request");
             Ok(workload_id.clone())
         })
     }
@@ -587,7 +590,7 @@ async fn handle_http_request<T: Router>(
             .expect("failed to build 400 response"));
     };
 
-    debug!(
+    info!(
         method = %method,
         uri = %uri,
         host = %workload_id,
@@ -599,7 +602,7 @@ async fn handle_http_request<T: Router>(
     // Look up workload handle for this host, with wildcard fallback
     let workload_handle = {
         let handles = workload_handles.read().await;
-        debug!(host = %workload_id, "looking up workload handle for host header");
+        info!(host = %workload_id, "looking up workload handle for host header");
         handles.get(&workload_id).cloned()
     };
 
@@ -612,7 +615,6 @@ async fn handle_http_request<T: Router>(
                     hyper::Response::builder()
                         .status(500)
                         .body(HyperOutgoingBody::default())
-                        // TODO: Add in the actual error message in the response body
                         // .body(HyperOutgoingBody::new(e.to_string()))
                         .expect("failed to build 500 response")
                 }

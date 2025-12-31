@@ -48,7 +48,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use names::{Generator, Name};
 use tokio::sync::RwLock;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::engine::Engine;
 use crate::engine::workload::ResolvedWorkload;
@@ -541,6 +541,10 @@ impl HostApi for Host {
 
         let (workload_state, message) = if has_workload {
             // Update state to stopping
+
+            // NOTE:
+            // resolved_workload heeft alleen een workload, wanneer die running is
+            // want anders heb je een unresolved workload
             let resolved_workload = {
                 let mut workloads = self.workloads.write().await;
                 trace!(
@@ -582,7 +586,15 @@ impl HostApi for Host {
 
             // Remove the workload from the active workloads map
             // This will drop the workload and clean up wasmtime resources
-            self.workloads.write().await.remove(&request.workload_id);
+            // NOTE:
+            // Wat als de workload nog niet geresolved is, dus workload_start is nog
+            // in volle gang, kan deze write er dan al bij? En dan dus die workload stoppen of
+            // gaat die dan gewoon door?
+            //
+            // Volgens mij zou dit altijd goed moeten gaan, behalve wanneer dit wordt aangeroepen
+            // wanneer de start nog niet is geweest
+            let hallo = self.workloads.write().await.remove(&request.workload_id);
+            drop(hallo);
 
             debug!(
                 workload_id = request.workload_id,
@@ -594,6 +606,10 @@ impl HostApi for Host {
                 "Workload stopped successfully".to_string(),
             )
         } else {
+            info!(
+                "Tried to stop non existing workload: {}",
+                request.workload_id
+            );
             (WorkloadState::Unspecified, "Workload not found".to_string())
         };
 
