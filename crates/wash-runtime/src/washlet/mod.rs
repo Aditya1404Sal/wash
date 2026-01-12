@@ -14,6 +14,7 @@ use futures::StreamExt as _;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::resource::{Resource, ResourceBuilder};
 use opentelemetry_semantic_conventions::resource;
+use std::time::SystemTime;
 use sysinfo::System;
 use tokio::sync::oneshot;
 use tracing::{debug, info};
@@ -308,6 +309,8 @@ async fn workload_start(
     req: types::v2::WorkloadStartRequest,
     config: &HostConfig,
 ) -> anyhow::Result<types::v2::WorkloadStartResponse> {
+    let start_time = SystemTime::now();
+    info!("Start workload time: {:?}", start_time);
     let Some(types::v2::Workload {
         workload_id,
         namespace,
@@ -380,6 +383,10 @@ async fn workload_start(
     } else {
         (vec![], vec![])
     };
+    info!(
+        "Workload pulled images in: {:?}s",
+        start_time.elapsed().expect("error").as_secs_f64()
+    );
 
     let service = if let Some(service) = service {
         let insecure_registries = env::var("INSECURE_REGISTRIES")
@@ -421,6 +428,11 @@ async fn workload_start(
         None
     };
 
+    info!(
+        "Workload pulled service in: {:?}s",
+        start_time.elapsed().expect("error").as_secs_f64()
+    );
+
     let volumes = volumes.into_iter().map(Into::into).collect();
 
     let request = crate::types::WorkloadStartRequest {
@@ -442,7 +454,14 @@ async fn workload_start(
         name=?request.workload.name,
         "Starting workload");
 
-    match host.workload_start(request).await {
+    let resp = host.workload_start(request).await;
+
+    info!(
+        "Workload started in: {:?}s",
+        start_time.elapsed().expect("error").as_secs_f64()
+    );
+
+    match resp {
         Ok(resp) => Ok(resp.into()),
         Err(e) => Ok(types::v2::WorkloadStartResponse {
             workload_status: Some(types::v2::WorkloadStatus {

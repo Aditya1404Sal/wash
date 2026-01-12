@@ -43,7 +43,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
 use names::{Generator, Name};
@@ -468,11 +468,19 @@ impl HostApi for Host {
         &self,
         request: WorkloadStartRequest,
     ) -> anyhow::Result<WorkloadStartResponse> {
+        let start_time = SystemTime::now();
+        info!("Start inner workload time: {:?}", start_time);
+
         // Store the workload with initial state
         self.workloads
             .write()
             .await
             .insert(request.workload_id.clone(), HostWorkload::Starting);
+
+        info!(
+            "Written workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         let service_present = request.workload.service.is_some();
 
@@ -481,9 +489,19 @@ impl HostApi for Host {
             .engine
             .initialize_workload(&request.workload_id, request.workload)?;
 
+        info!(
+            "Initialized workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
+
         let mut resolved_workload = unresolved_workload
             .resolve(Some(&self.plugins), self.http_handler.clone())
             .await?;
+
+        info!(
+            "Resolved workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         // If the service didn't run and we had one, warn
         if resolved_workload.execute_service().await? != service_present {
@@ -493,6 +511,11 @@ impl HostApi for Host {
             );
         }
 
+        info!(
+            "Executed service workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
+
         // Update the workload state to `Running`
         self.workloads
             .write()
@@ -501,6 +524,11 @@ impl HostApi for Host {
             .and_modify(|workload| {
                 *workload = HostWorkload::Running(Box::new(resolved_workload));
             });
+
+        info!(
+            "Finished inner start workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         Ok(WorkloadStartResponse {
             workload_status: WorkloadStatus {
@@ -788,7 +816,9 @@ impl HostBuilder {
         let engine = if let Some(engine) = self.engine {
             engine
         } else {
-            Engine::builder().build()?
+            let mut config = wasmtime::Config::default();
+            config.strategy(wasmtime::Strategy::Winch);
+            Engine::builder().with_config(config).build()?
         };
 
         // Get hostname from system if not provided
