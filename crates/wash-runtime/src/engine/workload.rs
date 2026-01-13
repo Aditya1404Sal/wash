@@ -805,9 +805,10 @@ impl ResolvedWorkload {
                                                 let mut results_buf =
                                                     vec![Val::Bool(false); results.len()];
 
+                                                const CALL_TIMEOUT_SECS: u64 = 10 * 60;
                                                 // Enforce a timeout on this call to prevent hanging indefinitely
                                                 const CALL_TIMEOUT: Duration =
-                                                    Duration::from_secs(30);
+                                                    Duration::from_secs(CALL_TIMEOUT_SECS);
                                                 timeout(
                                                     CALL_TIMEOUT,
                                                     func.call_async(
