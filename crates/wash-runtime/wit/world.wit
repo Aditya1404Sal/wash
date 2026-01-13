@@ -29,3 +29,7 @@ world messaging {
     import wasmcloud:messaging/consumer@0.2.0;
     export wasmcloud:messaging/handler@0.2.0;
 }
+
+world smtp{
+    import wasmcloud:smtp/client@0.2.0;
+}
