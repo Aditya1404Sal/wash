@@ -1,0 +1,73 @@
+package wasmcloud:smtp@0.2.0;
+
+interface client {
+    /// Configuration for establishing an SMTP connection
+    record credentials {
+        host: string,
+        port: u16,
+        username: option<string>,
+        password: option<string>,
+        /// Use STARTTLS (default: true)
+        secure: option<bool>,
+        /// Skip TLS certificate validation (default: false)
+        ignore-tls: option<bool>,
+        /// Require TLS connection (default: true)
+        require-tls: option<bool>,
+    }
+
+    /// Email sender information
+    record sender {
+        %from: string,
+        reply-to: option<string>,
+    }
+
+    /// Email recipients
+    record recipient {
+        to: list<string>,
+        cc: option<list<string>>,
+        bcc: option<list<string>>,
+    }
+
+    /// Email attachment reference
+    variant attachment-source {
+        /// Local file path
+        path(string),
+        /// Remote URL to fetch
+        url(string),
+    }
+
+    record attachment {
+        filename: string,
+        source: attachment-source,
+    }
+
+    /// Email message to send
+    record message {
+        sender: sender,
+        recipient: recipient,
+        subject: string,
+        /// HTML body content
+        body: string,
+        attachment: option<list<attachment>>,
+    }
+
+    /// Result of sending an email
+    record send-result {
+        accepted: bool,
+        server: option<string>,
+        message-id: option<string>,
+    }
+
+    resource smtp-client {
+        /// Create and connect to an SMTP server
+        /// Returns a client handle or error if connection fails
+        connect: static func(credentials: credentials) -> result<smtp-client, string>;
+
+        /// Send an email through this SMTP connection
+        send: func(message: message) -> result<send-result, string>;
+
+        /// Explicitly close the SMTP connection
+        /// Connection is also closed when the resource is dropped
+        disconnect: func() -> result<_, string>;
+    }
+}
