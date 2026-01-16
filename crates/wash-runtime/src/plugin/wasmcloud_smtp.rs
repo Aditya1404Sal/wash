@@ -5,7 +5,7 @@ use std::{
 
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message as LettreMessage, Tokio1Executor,
-    message::Attachment,
+    message::{Attachment, MultiPart, SinglePart, header::ContentType},
     transport::smtp::{
         authentication::Credentials as LettreCredentials,
         client::{Tls, TlsParameters},
@@ -34,26 +34,26 @@ mod bindings {
     });
 }
 
-/// Resource handle representing an SMTP client connection
+/// Wasmtime Resource handle that represents an SMTP client connection
 pub type SmtpClientHandle = String;
 
 /// Shared transport pool - multiple "clients" can reference the same transport
+/// the connection key is the Hash of host:port:username to identify unique connections
 #[derive(Clone)]
 pub struct SharedTransport {
     pub transport: Arc<AsyncSmtpTransport<Tokio1Executor>>,
     pub credentials: bindings::wasmcloud::smtp::client::Credentials,
     pub created_at: u64,
-    pub connection_key: String, // Hash of host:port:username to identify unique connections
+    pub connection_key: String,
 }
 
-/// Client reference that points to a shared transport
 #[derive(Clone)]
 pub struct SmtpClientData {
-    pub connection_key: String, // References a transport in the shared pool
+    pub connection_key: String,
     pub client_id: String,
 }
 
-/// SMTP host plugin with true connection pooling
+/// SMTP host plugin(with connection pooling)
 #[derive(Clone, Default)]
 pub struct WasmcloudSmtp {
     /// Shared transport pool - one transport per unique server configuration
@@ -92,19 +92,17 @@ impl WasmcloudSmtp {
         credentials.host.hash(&mut hasher);
         credentials.port.hash(&mut hasher);
         credentials.username.hash(&mut hasher);
-        credentials.password.hash(&mut hasher);
+        credentials.password.hash(&mut hasher); // TODO: Do we keep the password in the connection key hash as well ??
         // Add security settings to the hash
-        credentials.secure.hash(&mut hasher);
-        credentials.require_tls.hash(&mut hasher);
+        credentials.implicit_tls.hash(&mut hasher);
 
         format!("conn-{:x}", hasher.finish())
     }
 
-    /// Generate a unique client ID
     fn generate_client_id() -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-
+        // we only use timestamp for the client-is hash gen
         let mut hasher = DefaultHasher::new();
         let timestamp = Self::get_timestamp();
         timestamp.hash(&mut hasher);
@@ -113,40 +111,39 @@ impl WasmcloudSmtp {
         format!("client-{:x}", hasher.finish())
     }
 
-    /// Build an SMTP transport with proper TLS configuration
     fn build_transport(
         credentials: &bindings::wasmcloud::smtp::client::Credentials,
     ) -> anyhow::Result<AsyncSmtpTransport<Tokio1Executor>> {
-        // Build TLS parameters and optionally accept invalid certs/hostnames for testing
-        let mut tls_builder = TlsParameters::builder(credentials.host.clone());
-        if credentials.ignore_tls.unwrap_or(false) {
-            tls_builder = tls_builder.dangerous_accept_invalid_certs(true);
-            // When explicitly ignoring TLS checks in tests, also allow invalid hostnames
-            tls_builder = tls_builder.dangerous_accept_invalid_hostnames(true);
-        }
-
+        let tls_builder = TlsParameters::builder(credentials.host.clone());
         let tls_parameters = tls_builder.build()?;
 
-        // Choose appropriate relay and TLS mode. Port 465 uses implicit (wrapper) TLS.
-        let mut builder = match credentials.port {
-            465 => AsyncSmtpTransport::<Tokio1Executor>::relay(&credentials.host)?,
-            _ => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&credentials.host)?,
+        // 1. Initialize Builder (Sets defaults: 465 for relay, 587 for starttls)
+        let mut builder = match credentials.implicit_tls {
+            true => AsyncSmtpTransport::<Tokio1Executor>::relay(&credentials.host)?,
+            false => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&credentials.host)?,
         };
 
-        // For implicit TLS (port 465) use Wrapper, otherwise use Required or Opportunistic
-        let tls_mode = if credentials.port == 465 {
-            Tls::Wrapper(tls_parameters.clone())
-        } else if credentials.require_tls.unwrap_or(false) || credentials.secure.unwrap_or(true) {
-            Tls::Required(tls_parameters.clone())
+        // 2. Define Strict TLS Mode
+        // We explicitly set this to ensure the handshake matches our boolean flag.
+        let tls_mode = if credentials.implicit_tls {
+            Tls::Wrapper(tls_parameters)
         } else {
-            Tls::Opportunistic(tls_parameters.clone())
+            Tls::Required(tls_parameters)
         };
 
-        builder = builder.port(credentials.port).tls(tls_mode);
+        // Apply TLS mode
+        builder = builder.tls(tls_mode);
 
-        if let (Some(u), Some(p)) = (&credentials.username, &credentials.password) {
-            builder = builder.credentials(LettreCredentials::new(u.clone(), p.clone()));
+        // 3. ONLY set port if the user explicitly provided one.
+        // Otherwise, leave it alone so Lettre uses the standard defaults (465/587).
+        if let Some(custom_port) = credentials.port {
+            builder = builder.port(custom_port);
         }
+
+        builder = builder.credentials(LettreCredentials::new(
+            credentials.username.clone(),
+            credentials.password.clone(),
+        ));
 
         Ok(builder
             .pool_config(
@@ -325,6 +322,8 @@ impl bindings::wasmcloud::smtp::client::HostSmtpClient for Ctx {
         Ok(Ok(resource))
     }
 
+    // ... inside your impl ...
+
     async fn send(
         &mut self,
         client: Resource<SmtpClientHandle>,
@@ -336,7 +335,6 @@ impl bindings::wasmcloud::smtp::client::HostSmtpClient for Ctx {
             return Ok(Err("SMTP plugin not available".to_string()));
         };
 
-        // Get client data
         let connection_key = {
             let clients = plugin.clients.read().await;
             let empty_map = HashMap::new();
@@ -351,7 +349,6 @@ impl bindings::wasmcloud::smtp::client::HostSmtpClient for Ctx {
             client_data.connection_key.clone()
         };
 
-        // Get shared transport
         let shared_transport = {
             let pool = plugin.transport_pool.read().await;
             let Some(transport) = pool.get(&connection_key) else {
@@ -363,12 +360,11 @@ impl bindings::wasmcloud::smtp::client::HostSmtpClient for Ctx {
             transport.clone()
         };
 
-        // Build the email message
         let mut email_builder = LettreMessage::builder()
             .from(
                 message
                     .sender
-                    .from
+                    .address
                     .parse()
                     .map_err(|e| anyhow::Error::msg(format!("invalid sender address: {e}")))?,
             )
@@ -406,62 +402,22 @@ impl bindings::wasmcloud::smtp::client::HostSmtpClient for Ctx {
             }
         }
 
-        // Build the email with or without attachments
-        let email = if let Some(attachments) = message.attachment {
-            use lettre::message::{MultiPart, SinglePart, header::ContentType};
-
+        let email = if let Some(attachments) = message.attachments {
+            // Create Multipart Body (Mixed)
             let mut multipart = MultiPart::mixed().singlepart(
                 SinglePart::builder()
                     .header(ContentType::TEXT_HTML)
                     .body(message.body),
             );
 
-            // Add each attachment
+            // Process attachments (Guest will provide bytes, Host just forwards them)
             for attachment in attachments {
-                // Read the file content based on the source type
-                let file_content = match attachment.source {
-                    bindings::wasmcloud::smtp::client::AttachmentSource::Url(url) => {
-                        // Fetch from URL
-                        match reqwest::get(&url).await {
-                            Ok(response) => match response.bytes().await {
-                                Ok(bytes) => bytes.to_vec(),
-                                Err(e) => {
-                                    return Ok(Err(format!(
-                                        "Failed to download attachment '{}' from URL: {e}",
-                                        attachment.filename
-                                    )));
-                                }
-                            },
-                            Err(e) => {
-                                return Ok(Err(format!(
-                                    "Failed to fetch attachment '{}' from '{}': {e}",
-                                    attachment.filename, url
-                                )));
-                            }
-                        }
-                    }
-                    bindings::wasmcloud::smtp::client::AttachmentSource::Path(path) => {
-                        // Read from local file path
-                        match tokio::fs::read(&path).await {
-                            Ok(content) => content,
-                            Err(e) => {
-                                return Ok(Err(format!(
-                                    "Failed to read attachment file '{}' from path '{}': {e}",
-                                    attachment.filename, path
-                                )));
-                            }
-                        }
-                    }
-                };
-
-                // Determine content type from file extension
-                let mime_type = mime_guess::from_path(&attachment.filename).first_or_octet_stream();
-
-                let content_type = ContentType::parse(&mime_type.to_string())
+                // Use Guest provided content-type, or fallback to safe default
+                let content_type = ContentType::parse(&attachment.content_type)
                     .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
 
                 let attachment_part =
-                    Attachment::new(attachment.filename).body(file_content, content_type);
+                    Attachment::new(attachment.filename).body(attachment.content, content_type);
 
                 multipart = multipart.singlepart(attachment_part);
             }
@@ -471,50 +427,58 @@ impl bindings::wasmcloud::smtp::client::HostSmtpClient for Ctx {
             })?
         } else {
             email_builder
+                .header(ContentType::TEXT_HTML)
                 .body(message.body)
                 .map_err(|e| anyhow::Error::msg(format!("failed to build email: {e}")))?
         };
 
         tracing::info!(
-            workload_id = self.workload_id.to_string(),
-            client_id = client_id,
-            connection_key = connection_key,
-            subject = email
-                .envelope()
-                .from()
-                .map(|f| f.to_string())
-                .unwrap_or_default(),
+            workload_id = %self.workload_id,
+            client_id = %client_id,
+            connection_key = ?connection_key,
             "Sending email via shared SMTP transport"
         );
 
-        // Send using the shared transport's connection pool
         match shared_transport.transport.send(email).await {
             Ok(response) => {
                 tracing::debug!(
-                    workload_id = self.workload_id.to_string(),
-                    client_id = client_id,
-                    connection_key = connection_key,
+                    workload_id = %self.workload_id,
                     response = ?response,
-                    "Email sent successfully via shared transport"
+                    "Email sent successfully"
                 );
 
-                Ok(Ok(bindings::wasmcloud::smtp::client::SendResult {
-                    accepted: response.is_positive(),
-                    server: Some(format!(
-                        "{}:{}",
-                        shared_transport.credentials.host, shared_transport.credentials.port
-                    )),
-                    message_id: {
-                        let msg = response.message().collect::<Vec<_>>().join("\n");
-                        if msg.is_empty() { None } else { Some(msg) }
+                // Extract Message ID
+                let raw_msg = response.message().collect::<Vec<_>>().join(" ");
+                let message_id_opt = if raw_msg.is_empty() {
+                    None
+                } else {
+                    Some(raw_msg)
+                };
+
+                // Calculate Effective Port for Display Only
+                // If the user provided a port, use it. If not, infer the standard default.
+                let effective_port = shared_transport.credentials.port.unwrap_or(
+                    if shared_transport.credentials.implicit_tls {
+                        465
+                    } else {
+                        587
                     },
+                );
+
+                let server_addr = Some(format!(
+                    "{}:{}",
+                    shared_transport.credentials.host, effective_port
+                ));
+
+                Ok(Ok(bindings::wasmcloud::smtp::client::SendResult {
+                    accepted: true,
+                    server: server_addr,
+                    message_id: message_id_opt,
                 }))
             }
             Err(e) => {
                 tracing::error!(
-                    workload_id = self.workload_id.to_string(),
-                    client_id = client_id,
-                    connection_key = connection_key,
+                    workload_id = %self.workload_id,
                     error = %e,
                     "Failed to send email"
                 );
@@ -591,22 +555,18 @@ mod tests {
     fn test_connection_key_consistency() {
         let creds1 = bindings::wasmcloud::smtp::client::Credentials {
             host: "smtp.gmail.com".to_string(),
-            port: 587,
-            username: Some("test@gmail.com".to_string()),
-            password: Some("password".to_string()),
-            secure: Some(false),
-            ignore_tls: Some(false),
-            require_tls: Some(true),
+            port: None,
+            username: "test@gmail.com".to_string(),
+            password: "password".to_string(),
+            implicit_tls: true,
         };
 
         let creds2 = bindings::wasmcloud::smtp::client::Credentials {
             host: "smtp.gmail.com".to_string(),
-            port: 587,
-            username: Some("test@gmail.com".to_string()),
-            password: Some("password".to_string()),
-            secure: Some(false),
-            ignore_tls: Some(false),
-            require_tls: Some(true),
+            port: None,
+            username: "test@gmail.com".to_string(),
+            password: "password".to_string(),
+            implicit_tls: true,
         };
 
         let key1 = WasmcloudSmtp::generate_connection_key(&creds1);

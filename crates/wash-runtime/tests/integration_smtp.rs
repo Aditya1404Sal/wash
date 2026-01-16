@@ -85,6 +85,13 @@ async fn test_smtp_demo_integration() -> Result<()> {
                     },
                 },
                 WitInterface {
+                    namespace: "wasi".to_string(),
+                    package: "http".to_string(),
+                    interfaces: ["outgoing-handler".to_string()].into_iter().collect(),
+                    version: Some(semver::Version::parse("0.2.2").unwrap()),
+                    config: HashMap::new(),
+                },
+                WitInterface {
                     namespace: "wasmcloud".to_string(),
                     package: "smtp".to_string(),
                     interfaces: ["client".to_string()].into_iter().collect(),
@@ -367,6 +374,13 @@ async fn test_smtp_attachments_filesystem_and_url() -> Result<()> {
                         config.insert("host".to_string(), "smtp-test".to_string());
                         config
                     },
+                },
+                WitInterface {
+                    namespace: "wasi".to_string(),
+                    package: "http".to_string(),
+                    interfaces: ["outgoing-handler".to_string()].into_iter().collect(),
+                    version: Some(semver::Version::parse("0.2.2").unwrap()),
+                    config: HashMap::new(),
                 },
                 WitInterface {
                     namespace: "wasmcloud".to_string(),

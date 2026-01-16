@@ -1,24 +1,25 @@
 package wasmcloud:smtp@0.2.0;
 
 interface client {
-    /// Configuration for establishing an SMTP connection
+    /// Configuration for establishing a secure SMTP connection.
+    /// Note: TLS is strictly enforced; plaintext connections are not supported.
     record credentials {
         host: string,
-        port: u16,
-        username: option<string>,
-        password: option<string>,
-        /// Use STARTTLS (default: true)
-        secure: option<bool>,
-        /// Skip TLS certificate validation (default: false)
-        ignore-tls: option<bool>,
-        /// Require TLS connection (default: true)
-        require-tls: option<bool>,
+        port: option<u16>,
+        username: string,
+        password: string,
+        /// If true, use Implicit TLS (port 465). Connection is encrypted immediately.
+        /// If false, uses Explicit TLS (STARTTLS port 587). Connection upgrades to TLS immediately after connection.
+        implicit-tls: bool,
     }
 
     /// Email sender information
     record sender {
-        %from: string,
+        /// bacause "from" is a keyword in some languages, we rename for clarity or keep % escape
+        address: string,
         reply-to: option<string>,
+        /// Optional display name (e.g., "Support Team <support@example.com>")
+        name: option<string>,
     }
 
     /// Email recipients
@@ -28,17 +29,14 @@ interface client {
         bcc: option<list<string>>,
     }
 
-    /// Email attachment reference
-    variant attachment-source {
-        /// Local file path
-        path(string),
-        /// Remote URL to fetch
-        url(string),
-    }
-
     record attachment {
         filename: string,
-        source: attachment-source,
+        /// Content type (e.g., "application/pdf")
+        content-type: string,
+        /// Raw file content bytes. 
+        /// This is safer than passing a path, as it prevents the provider 
+        /// from reading host files the actor shouldn't access.
+        content: list<u8>,
     }
 
     /// Email message to send
@@ -48,7 +46,7 @@ interface client {
         subject: string,
         /// HTML body content
         body: string,
-        attachment: option<list<attachment>>,
+        attachments: option<list<attachment>>,
     }
 
     /// Result of sending an email
@@ -61,13 +59,14 @@ interface client {
     resource smtp-client {
         /// Create and connect to an SMTP server
         /// Returns a client handle or error if connection fails
-        connect: static func(credentials: credentials) -> result<smtp-client, string>;
+        connect: static func(creds: credentials) -> result<smtp-client, string>;
 
         /// Send an email through this SMTP connection
-        send: func(message: message) -> result<send-result, string>;
+        send: func(msg: message) -> result<send-result, string>;
 
-        /// Explicitly close the SMTP connection
-        /// Connection is also closed when the resource is dropped
+        /// Explicitly close the connection. 
+        /// Note: Resources are automatically cleaned up when dropped, 
+        /// but this allows handling closure errors explicitly.
         disconnect: func() -> result<_, string>;
     }
 }

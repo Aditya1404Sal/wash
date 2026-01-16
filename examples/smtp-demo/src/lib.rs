@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::sync::{Mutex, OnceLock};
+use std::fs;
 
 mod bindings {
     wit_bindgen::generate!({
@@ -10,12 +11,16 @@ mod bindings {
 use bindings::{
     exports::wasi::http::incoming_handler::Guest,
     wasi::{
-        http::types::{Fields, IncomingRequest, OutgoingBody, OutgoingResponse, ResponseOutparam},
+        http::types::{
+            Fields, IncomingRequest, OutgoingBody, OutgoingRequest, OutgoingResponse, 
+            ResponseOutparam, Scheme, Method
+        },
+        http::outgoing_handler,
         io::streams::StreamError,
         logging::logging::{log, Level},
     },
     wasmcloud::smtp::client::{
-        Attachment, AttachmentSource, Credentials, Message, Recipient, Sender, SmtpClient,
+        Attachment, Credentials, Message, Recipient, Sender, SmtpClient,
     },
 };
 use serde_json::Value;
@@ -49,20 +54,17 @@ fn handle_request(request: IncomingRequest) -> Result<String> {
     log(Level::Info, "", "📧 Processing incoming SMTP request");
 
     let body_content = read_request_body(request)?;
-    log(
-        Level::Info,
-        "",
-        &format!("📥 Request body: {} bytes", body_content.len()),
-    );
-
+    
     // Parse the request to extract SMTP credentials
     let smtp_config = parse_smtp_config(&body_content)?;
 
+    // Handle Connection Pooling
     let client_mutex = SMTP_CLIENT.get_or_init(|| Mutex::new(None));
     let mut client_state = client_mutex
         .lock()
         .map_err(|e| anyhow::anyhow!("Failed to acquire lock: {e}"))?;
 
+    // Connect if not already connected
     if client_state.is_none() {
         log(Level::Info, "", "🔌 Initializing SMTP client connection");
 
@@ -88,16 +90,20 @@ fn handle_request(request: IncomingRequest) -> Result<String> {
         }
     }
 
+    // Retrieve client from state
     let client = match client_state.as_ref() {
         Some(SmtpClientState::Connected(client)) => client,
         Some(SmtpClientState::Failed(error)) => {
+            // Retry logic could go here, but for now we fail fast
             return Err(anyhow::anyhow!("Previous connection failed: {}", error));
         }
         None => return Err(anyhow::anyhow!("Client not initialized")),
     };
 
+    // Build message (Reads files from disk or URL if needed)
     let message = build_email_message(&body_content, &smtp_config)?;
-    let attachment_info = if message.attachment.is_some() {
+    
+    let attachment_info = if message.attachments.is_some() {
         "with attachment"
     } else {
         "without attachment"
@@ -109,6 +115,7 @@ fn handle_request(request: IncomingRequest) -> Result<String> {
         &format!("📨 Sending: {} {}", message.subject, attachment_info),
     );
 
+    // Send via the Provider
     let result = client
         .send(&message)
         .map_err(|e| anyhow::anyhow!("Send failed: {e}"))?;
@@ -191,15 +198,6 @@ fn parse_smtp_config(body_content: &str) -> Result<SmtpConfig> {
         return Err(anyhow::anyhow!("Missing 'to' email address(es)"));
     };
 
-    log(
-        Level::Info,
-        "",
-        &format!(
-            "📧 SMTP Config: {}:{} (from: {}, to: {:?})",
-            host, port, from, to
-        ),
-    );
-
     Ok(SmtpConfig {
         host,
         port,
@@ -211,23 +209,28 @@ fn parse_smtp_config(body_content: &str) -> Result<SmtpConfig> {
 }
 
 fn try_connect_smtp(config: &SmtpConfig) -> Result<SmtpClient> {
+    // Automatic TLS Selection Logic
+    // Port 465 -> Implicit TLS (SSL)
+    // Port 587/25/2525 -> Explicit TLS (STARTTLS)
+    let implicit_tls = config.port == 465;
+
+    let tls_mode = if implicit_tls { "Implicit (SSL)" } else { "Explicit (STARTTLS)" };
+    
     log(
         Level::Info,
         "",
         &format!(
-            "🔄 Connecting to {}:{} (SSL/TLS)...",
-            config.host, config.port
+            "🔄 Connecting to {}:{} using {}...",
+            config.host, config.port, tls_mode
         ),
     );
 
     let creds = Credentials {
         host: config.host.clone(),
-        port: config.port,
-        username: Some(config.username.clone()),
-        password: Some(config.password.clone()),
-        secure: Some(true),
-        ignore_tls: Some(false),
-        require_tls: Some(true),
+        port: Some(config.port),
+        username: config.username.clone(),
+        password: config.password.clone(),
+        implicit_tls, 
     };
 
     match SmtpClient::connect(&creds) {
@@ -268,17 +271,162 @@ fn read_request_body(request: IncomingRequest) -> Result<String> {
     String::from_utf8(body_data).context("Invalid UTF-8 in request body")
 }
 
+/// Downloads a file from a URL using WASI HTTP outgoing handler
+fn download_from_url(url: &str) -> Result<Vec<u8>> {
+    log(Level::Info, "", &format!("🌐 Downloading attachment from: {}", url));
+
+    // Parse the URL to extract components
+    let parsed_url = parse_url(url)?;
+    
+    // Create outgoing request
+    let headers = Fields::new();
+    let outgoing_request = OutgoingRequest::new(headers);
+    
+    // Set the request method to GET
+    outgoing_request.set_method(&Method::Get)
+        .map_err(|_| anyhow::anyhow!("Failed to set method"))?;
+    
+    // Set the scheme (http or https)
+    outgoing_request.set_scheme(Some(&parsed_url.scheme))
+        .map_err(|_| anyhow::anyhow!("Failed to set scheme"))?;
+    
+    // Set the authority (host:port)
+    outgoing_request.set_authority(Some(&parsed_url.authority))
+        .map_err(|_| anyhow::anyhow!("Failed to set authority"))?;
+    
+    // Set the path and query
+    outgoing_request.set_path_with_query(Some(&parsed_url.path_and_query))
+        .map_err(|_| anyhow::anyhow!("Failed to set path"))?;
+
+    log(Level::Info, "", &format!("📤 Sending HTTP request to {}", url));
+
+    // Send the request
+    let future_response = outgoing_handler::handle(outgoing_request, None)
+        .map_err(|e| anyhow::anyhow!("Failed to send HTTP request: {e:?}"))?;
+
+    // Wait for the response
+    let incoming_response = match future_response.get() {
+        Some(result) => result.map_err(|e| anyhow::anyhow!("HTTP request failed: {e:?}"))?,
+        None => {
+            future_response.subscribe().block();
+            future_response
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("Failed to get response"))?
+                .map_err(|e| anyhow::anyhow!("HTTP request failed: {e:?}"))?
+        }
+    }
+    .map_err(|e| anyhow::anyhow!("HTTP response error: {e:?}"))?;
+
+    // Check status code
+    let status = incoming_response.status();
+    if status < 200 || status >= 300 {
+        return Err(anyhow::anyhow!(
+            "HTTP request failed with status code: {}",
+            status
+        ));
+    }
+
+    log(Level::Info, "", &format!("✅ Received response with status: {}", status));
+
+    // Read the response body
+    let response_body = incoming_response
+        .consume()
+        .map_err(|_| anyhow::anyhow!("Failed to consume response"))?;
+
+    let input_stream = response_body
+        .stream()
+        .map_err(|_| anyhow::anyhow!("Failed to get response stream"))?;
+
+    let mut data = Vec::new();
+    loop {
+        match input_stream.blocking_read(8192) {
+            Ok(chunk) if chunk.is_empty() => break,
+            Ok(chunk) => data.extend_from_slice(&chunk),
+            Err(StreamError::Closed) => break,
+            Err(e) => return Err(anyhow::anyhow!("Stream error while reading response: {e:?}")),
+        }
+    }
+
+    log(Level::Info, "", &format!("📦 Downloaded {} bytes from URL", data.len()));
+
+    Ok(data)
+}
+
+/// Simple URL parser for extracting scheme, authority, and path
+struct ParsedUrl {
+    scheme: Scheme,
+    authority: String,
+    path_and_query: String,
+}
+
+fn parse_url(url: &str) -> Result<ParsedUrl> {
+    // Split scheme
+    let (scheme_str, rest) = url
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("Invalid URL: missing scheme"))?;
+
+    let scheme = match scheme_str.to_lowercase().as_str() {
+        "http" => Scheme::Http,
+        "https" => Scheme::Https,
+        other => Scheme::Other(other.to_string()),
+    };
+
+    // Split authority and path
+    let (authority, path_and_query) = if let Some(idx) = rest.find('/') {
+        let (auth, path) = rest.split_at(idx);
+        (auth.to_string(), path.to_string())
+    } else {
+        (rest.to_string(), "/".to_string())
+    };
+
+    Ok(ParsedUrl {
+        scheme,
+        authority,
+        path_and_query,
+    })
+}
+
+/// Extracts filename from URL (last segment of path)
+fn extract_filename_from_url(url: &str) -> String {
+    url.split('/')
+        .last()
+        .and_then(|s| s.split('?').next()) // Remove query params
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "downloaded_attachment".to_string())
+}
+
+/// Attempts to guess content type from filename extension
+fn guess_content_type(filename: &str) -> String {
+    let extension = filename.split('.').last().unwrap_or("");
+    
+    match extension.to_lowercase().as_str() {
+        "pdf" => "application/pdf",
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Message> {
-    // Parse JSON for email content
     let json: Value = serde_json::from_str(body_content)?;
 
-    let mut email_body = json
+    let email_body = json
         .get("body")
         .and_then(|v| v.as_str())
         .unwrap_or("Test email from SMTP component")
         .to_string();
-
-    let mut attachment: Option<Vec<Attachment>> = None;
 
     let subject = json
         .get("subject")
@@ -286,98 +434,105 @@ fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Messag
         .unwrap_or("Test Email from SMTP Component")
         .to_string();
 
-    // Parse filesystem attachment
+    let mut attachments: Option<Vec<Attachment>> = None;
+
+    // Handle Local File Attachment (Guest reads file -> sends bytes)
+    // NOTE: This component requires wasi:filesystem access to the path provided.
     if let Some(path_val) = json.get("attachment_path").and_then(|v| v.as_str()) {
         log(
             Level::Info,
             "",
-            &format!("📎 Adding filesystem attachment: {}", path_val),
+            &format!("📎 Reading attachment from filesystem: {}", path_val),
         );
 
         let filename = std::path::Path::new(path_val)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "attachment".to_string());
+            .unwrap_or_else(|| "attachment.bin".to_string());
 
-        attachment = Some(vec![Attachment {
+        // Read the file bytes directly inside the guest
+        let content = fs::read(path_val)
+            .with_context(|| format!("Failed to read attachment at path: {}", path_val))?;
+
+        log(Level::Info, "", &format!("📎 Read {} bytes", content.len()));
+
+        let content_type = guess_content_type(&filename);
+
+        attachments = Some(vec![Attachment {
             filename,
-            source: AttachmentSource::Path(path_val.to_string()),
+            content_type,
+            content, 
         }]);
     }
 
-    // Parse URL-based attachment (takes precedence if both are provided)
+    // Handle URL Attachment - Download from URL using WASI HTTP outgoing handler
     if let Some(url_val) = json.get("attachment_url").and_then(|v| v.as_str()) {
         log(
             Level::Info,
             "",
-            &format!("🌐 Adding URL-based attachment: {}", url_val),
+            &format!("🌐 Fetching attachment from URL: {}", url_val)
         );
 
-        let filename = std::path::Path::new(url_val)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "downloaded-attachment.pdf".to_string());
+        // Download the file from the URL
+        let content = download_from_url(url_val)
+            .with_context(|| format!("Failed to download attachment from URL: {}", url_val))?;
 
-        attachment = Some(vec![Attachment {
-            filename,
-            source: AttachmentSource::Url(url_val.to_string()),
-        }]);
+        let filename = extract_filename_from_url(url_val);
+        let content_type = guess_content_type(&filename);
+
+        log(
+            Level::Info,
+            "",
+            &format!("📎 Downloaded {} bytes as '{}'", content.len(), filename)
+        );
+
+        // If we already have an attachment from file path, add this as a second attachment
+        if let Some(ref mut existing_attachments) = attachments {
+            existing_attachments.push(Attachment {
+                filename,
+                content_type,
+                content,
+            });
+        } else {
+            attachments = Some(vec![Attachment {
+                filename,
+                content_type,
+                content,
+            }]);
+        }
     }
 
-    // Optional CC and BCC
-    let cc = json.get("cc").and_then(|v| {
-        let mut emails = Vec::new();
-        if v.is_array() {
-            if let Some(arr) = v.as_array() {
-                for item in arr {
-                    if let Some(s) = item.as_str() {
-                        emails.push(s.to_string());
+    // Helper to parse lists
+    let parse_list = |key: &str| -> Option<Vec<String>> {
+        json.get(key).and_then(|v| {
+            let mut emails = Vec::new();
+            if v.is_array() {
+                if let Some(arr) = v.as_array() {
+                    for item in arr {
+                        if let Some(s) = item.as_str() { emails.push(s.to_string()); }
                     }
                 }
+            } else if let Some(s) = v.as_str() {
+                emails.push(s.to_string());
             }
-        } else if let Some(s) = v.as_str() {
-            emails.push(s.to_string());
-        }
-        if emails.is_empty() {
-            None
-        } else {
-            Some(emails)
-        }
-    });
-
-    let bcc = json.get("bcc").and_then(|v| {
-        let mut emails = Vec::new();
-        if v.is_array() {
-            if let Some(arr) = v.as_array() {
-                for item in arr {
-                    if let Some(s) = item.as_str() {
-                        emails.push(s.to_string());
-                    }
-                }
-            }
-        } else if let Some(s) = v.as_str() {
-            emails.push(s.to_string());
-        }
-        if emails.is_empty() {
-            None
-        } else {
-            Some(emails)
-        }
-    });
+            if emails.is_empty() { None } else { Some(emails) }
+        })
+    };
 
     Ok(Message {
         sender: Sender {
-            from: config.from.clone(),
+            address: config.from.clone(),
             reply_to: None,
+            name: None,
         },
         recipient: Recipient {
             to: config.to.clone(),
-            cc,
-            bcc,
+            cc: parse_list("cc"),
+            bcc: parse_list("bcc"),
         },
         subject,
         body: email_body,
-        attachment,
+        attachments,
     })
 }
 
