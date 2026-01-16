@@ -1,4 +1,4 @@
-//! Integration test for smtp-demo component with concurrent support
+//! Integration test for smtp-demo component with concurrent support and URL attachments
 
 use anyhow::{Context, Result};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -19,6 +19,7 @@ use wash_runtime::{
 };
 
 const SMTP_DEMO_WASM: &[u8] = include_bytes!("fixtures/smtp_demo.wasm");
+
 #[tokio::test]
 async fn test_smtp_demo_integration() -> Result<()> {
     tracing_subscriber::fmt()
@@ -315,13 +316,13 @@ async fn test_smtp_demo_integration() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_smtp_attachments_filesystem_and_url() -> Result<()> {
+async fn test_smtp_attachments_url() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init()
         .ok();
 
-    println!("Starting SMTP attachment test (filesystem + URL)");
+    println!("Starting SMTP attachment test (URL-based)");
 
     let engine = Engine::builder().build()?;
     let port = find_available_port().await?;
@@ -426,9 +427,9 @@ async fn test_smtp_attachments_filesystem_and_url() -> Result<()> {
     let from_email = "";
     let to_email = "";
 
-    // Test 1: Send email with URL-based attachment
-    println!("\n=== Test 1: URL-based Attachment ===");
-    let url_payload = serde_json::json!({
+    // Test 1: Send email with URL-based attachment (PDF)
+    println!("\n=== Test 1: URL-based Attachment (PDF) ===");
+    let pdf_payload = serde_json::json!({
         "smtp": {
             "host": "smtp.gmail.com",
             "port": 465,
@@ -437,31 +438,73 @@ async fn test_smtp_attachments_filesystem_and_url() -> Result<()> {
         },
         "from": from_email,
         "to": [to_email],
-        "subject": "Test Email - URL Attachment",
-        "body": "This email contains a PDF attachment downloaded from a URL.",
-        "attachment_url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
+        "subject": "Test Email - PDF Attachment from URL",
+        "body": "<h1>PDF Attachment Test</h1><p>This email contains a PDF attachment downloaded from a URL.</p>",
+        "attachments": [{
+            "url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+            "filename": "sample-document.pdf",
+            "content_type": "application/pdf"
+        }]
     });
 
-    let url_response = timeout(
-        Duration::from_secs(30),
+    let pdf_response = timeout(
+        Duration::from_secs(45),
         client
             .post(format!("http://{addr}/"))
             .header("HOST", "smtp-test")
             .header("Content-Type", "application/json")
-            .json(&url_payload)
+            .json(&pdf_payload)
             .send(),
     )
     .await
-    .context("URL attachment request timed out")?
-    .context("Failed to send URL attachment request")?;
+    .context("PDF attachment request timed out")?
+    .context("Failed to send PDF attachment request")?;
 
-    let url_status = url_response.status();
-    let url_text = url_response.text().await.unwrap_or_default();
-    println!("URL Attachment - Status: {}", url_status);
-    println!("Response: {}", url_text.trim());
+    let pdf_status = pdf_response.status();
+    let pdf_text = pdf_response.text().await.unwrap_or_default();
+    println!("PDF Attachment - Status: {}", pdf_status);
+    println!("Response: {}", pdf_text.trim());
 
-    // Test 2: Send simple email without attachment
-    println!("\n=== Test 2: Simple Email (No Attachment) ===");
+    // Test 2: Send email with URL-based attachment (MP4 Video)
+    println!("\n=== Test 2: URL-based Attachment (MP4 Video) ===");
+    let video_payload = serde_json::json!({
+        "smtp": {
+            "host": "smtp.gmail.com",
+            "port": 465,
+            "username": smtp_username,
+            "password": smtp_password
+        },
+        "from": from_email,
+        "to": [to_email],
+        "subject": "Test Email - Video Attachment from URL",
+        "body": "<h1>Video Attachment Test</h1><p>This email contains a short MP4 video downloaded from a URL.</p>",
+        "attachments": [{
+            "url": "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",
+            "filename": "sample-video.mp4",
+            "content_type": "video/mp4"
+        }]
+    });
+
+    let video_response = timeout(
+        Duration::from_secs(60), // Longer timeout for video
+        client
+            .post(format!("http://{addr}/"))
+            .header("HOST", "smtp-test")
+            .header("Content-Type", "application/json")
+            .json(&video_payload)
+            .send(),
+    )
+    .await
+    .context("Video attachment request timed out")?
+    .context("Failed to send video attachment request")?;
+
+    let video_status = video_response.status();
+    let video_text = video_response.text().await.unwrap_or_default();
+    println!("Video Attachment - Status: {}", video_status);
+    println!("Response: {}", video_text.trim());
+
+    // Test 3: Send simple email without attachment
+    println!("\n=== Test 3: Simple Email (No Attachment) ===");
     let simple_payload = serde_json::json!({
         "smtp": {
             "host": "smtp.gmail.com",
@@ -493,8 +536,53 @@ async fn test_smtp_attachments_filesystem_and_url() -> Result<()> {
     println!("Simple Email - Status: {}", simple_status);
     println!("Response: {}", simple_text.trim());
 
-    // Test 4: Email with CC and BCC
-    println!("\n=== Test 3: Email with CC and BCC ===");
+    // Test 4: Email with multiple attachments (PNG + JSON)
+    println!("\n=== Test 4: Multiple URL Attachments ===");
+    let multiple_payload = serde_json::json!({
+        "smtp": {
+            "host": "smtp.gmail.com",
+            "port": 465,
+            "username": smtp_username,
+            "password": smtp_password
+        },
+        "from": from_email,
+        "to": [to_email],
+        "subject": "Test Email - Multiple Attachments",
+        "body": "<h1>Multiple Attachments Test</h1><p>This email contains multiple files from different URLs.</p>",
+        "attachments": [
+            {
+                "url": "https://httpbin.org/image/png",
+                "filename": "test-image.png",
+                "content_type": "image/png"
+            },
+            {
+                "url": "https://httpbin.org/json",
+                "filename": "test-data.json",
+                "content_type": "application/json"
+            }
+        ]
+    });
+
+    let multiple_response = timeout(
+        Duration::from_secs(45),
+        client
+            .post(format!("http://{addr}/"))
+            .header("HOST", "smtp-test")
+            .header("Content-Type", "application/json")
+            .json(&multiple_payload)
+            .send(),
+    )
+    .await
+    .context("Multiple attachments request timed out")?
+    .context("Failed to send multiple attachments request")?;
+
+    let multiple_status = multiple_response.status();
+    let multiple_text = multiple_response.text().await.unwrap_or_default();
+    println!("Multiple Attachments - Status: {}", multiple_status);
+    println!("Response: {}", multiple_text.trim());
+
+    // Test 5: Email with CC and BCC
+    println!("\n=== Test 5: Email with CC and BCC ===");
     let cc_bcc_payload = serde_json::json!({
         "smtp": {
             "host": "smtp.gmail.com",
@@ -529,31 +617,47 @@ async fn test_smtp_attachments_filesystem_and_url() -> Result<()> {
     println!("Response: {}", cc_bcc_text.trim());
 
     // Results summary
-    println!("\n┌─────────────────────────────────────────────────────────────┐");
-    println!("│          SMTP Attachment Test Results                      │");
-    println!("├─────────────────────────────────────────────────────────────┤");
-    println!("│ Test Case                        │ Status    │ Result      │");
-    println!("├──────────────────────────────────┼───────────┼─────────────┤");
-    let url_pass = url_status.is_success();
+    println!("\n┌──────────────────────────────────────────────────────────────────┐");
+    println!("│          SMTP Attachment Test Results                           │");
+    println!("├──────────────────────────────────────────────────────────────────┤");
+    println!("│ Test Case                        │ Status    │ Result          │");
+    println!("├──────────────────────────────────┼───────────┼─────────────────┤");
+    let pdf_pass = pdf_status.is_success();
+    let video_pass = video_status.is_success();
     let simple_pass = simple_status.is_success();
+    let multiple_pass = multiple_status.is_success();
     let cc_bcc_pass = cc_bcc_status.is_success();
 
     println!(
-        "│ URL-based attachment             │ {:3}       │ {}       │",
-        url_status.as_u16(),
-        if url_pass { "✓ PASS" } else { "✗ FAIL" }
+        "│ PDF attachment from URL          │ {:3}       │ {}           │",
+        pdf_status.as_u16(),
+        if pdf_pass { "✓ PASS" } else { "✗ FAIL" }
     );
     println!(
-        "│ Simple email (no attachment)     │ {:3}       │ {}       │",
+        "│ MP4 video attachment from URL    │ {:3}       │ {}           │",
+        video_status.as_u16(),
+        if video_pass { "✓ PASS" } else { "✗ FAIL" }
+    );
+    println!(
+        "│ Simple email (no attachment)     │ {:3}       │ {}           │",
         simple_status.as_u16(),
         if simple_pass { "✓ PASS" } else { "✗ FAIL" }
     );
     println!(
-        "│ Email with CC and BCC            │ {:3}       │ {}       │",
+        "│ Multiple attachments (PNG+JSON)  │ {:3}       │ {}           │",
+        multiple_status.as_u16(),
+        if multiple_pass {
+            "✓ PASS"
+        } else {
+            "✗ FAIL"
+        }
+    );
+    println!(
+        "│ Email with CC and BCC            │ {:3}       │ {}           │",
         cc_bcc_status.as_u16(),
         if cc_bcc_pass { "✓ PASS" } else { "✗ FAIL" }
     );
-    println!("└──────────────────────────────────┴───────────┴─────────────┘");
+    println!("└──────────────────────────────────┴───────────┴─────────────────┘");
 
     assert!(simple_pass, "Simple email should succeed");
 

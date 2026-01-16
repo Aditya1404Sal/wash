@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use std::sync::{Mutex, OnceLock};
-use std::fs;
 
 mod bindings {
     wit_bindgen::generate!({
@@ -11,17 +10,15 @@ mod bindings {
 use bindings::{
     exports::wasi::http::incoming_handler::Guest,
     wasi::{
-        http::types::{
-            Fields, IncomingRequest, OutgoingBody, OutgoingRequest, OutgoingResponse, 
-            ResponseOutparam, Scheme, Method
-        },
         http::outgoing_handler,
+        http::types::{
+            Fields, IncomingRequest, Method, OutgoingBody, OutgoingRequest, OutgoingResponse,
+            ResponseOutparam, Scheme,
+        },
         io::streams::StreamError,
         logging::logging::{log, Level},
     },
-    wasmcloud::smtp::client::{
-        Attachment, Credentials, Message, Recipient, Sender, SmtpClient,
-    },
+    wasmcloud::smtp::client::{Attachment, Credentials, Message, Recipient, Sender, SmtpClient},
 };
 use serde_json::Value;
 
@@ -54,7 +51,7 @@ fn handle_request(request: IncomingRequest) -> Result<String> {
     log(Level::Info, "", "📧 Processing incoming SMTP request");
 
     let body_content = read_request_body(request)?;
-    
+
     // Parse the request to extract SMTP credentials
     let smtp_config = parse_smtp_config(&body_content)?;
 
@@ -100,9 +97,9 @@ fn handle_request(request: IncomingRequest) -> Result<String> {
         None => return Err(anyhow::anyhow!("Client not initialized")),
     };
 
-    // Build message (Reads files from disk or URL if needed)
+    // Build message (Downloads files from URLs if needed)
     let message = build_email_message(&body_content, &smtp_config)?;
-    
+
     let attachment_info = if message.attachments.is_some() {
         "with attachment"
     } else {
@@ -214,8 +211,12 @@ fn try_connect_smtp(config: &SmtpConfig) -> Result<SmtpClient> {
     // Port 587/25/2525 -> Explicit TLS (STARTTLS)
     let implicit_tls = config.port == 465;
 
-    let tls_mode = if implicit_tls { "Implicit (SSL)" } else { "Explicit (STARTTLS)" };
-    
+    let tls_mode = if implicit_tls {
+        "Implicit (SSL)"
+    } else {
+        "Explicit (STARTTLS)"
+    };
+
     log(
         Level::Info,
         "",
@@ -230,7 +231,7 @@ fn try_connect_smtp(config: &SmtpConfig) -> Result<SmtpClient> {
         port: Some(config.port),
         username: config.username.clone(),
         password: config.password.clone(),
-        implicit_tls, 
+        implicit_tls,
     };
 
     match SmtpClient::connect(&creds) {
@@ -260,7 +261,7 @@ fn read_request_body(request: IncomingRequest) -> Result<String> {
 
     let mut body_data = Vec::new();
     loop {
-        match input_stream.read(8192) {
+        match input_stream.blocking_read(8192) {
             Ok(chunk) if chunk.is_empty() => break,
             Ok(chunk) => body_data.extend_from_slice(&chunk),
             Err(StreamError::Closed) => break,
@@ -273,32 +274,44 @@ fn read_request_body(request: IncomingRequest) -> Result<String> {
 
 /// Downloads a file from a URL using WASI HTTP outgoing handler
 fn download_from_url(url: &str) -> Result<Vec<u8>> {
-    log(Level::Info, "", &format!("🌐 Downloading attachment from: {}", url));
+    log(
+        Level::Info,
+        "",
+        &format!("🌐 Downloading attachment from: {}", url),
+    );
 
     // Parse the URL to extract components
     let parsed_url = parse_url(url)?;
-    
+
     // Create outgoing request
     let headers = Fields::new();
     let outgoing_request = OutgoingRequest::new(headers);
-    
+
     // Set the request method to GET
-    outgoing_request.set_method(&Method::Get)
+    outgoing_request
+        .set_method(&Method::Get)
         .map_err(|_| anyhow::anyhow!("Failed to set method"))?;
-    
+
     // Set the scheme (http or https)
-    outgoing_request.set_scheme(Some(&parsed_url.scheme))
+    outgoing_request
+        .set_scheme(Some(&parsed_url.scheme))
         .map_err(|_| anyhow::anyhow!("Failed to set scheme"))?;
-    
+
     // Set the authority (host:port)
-    outgoing_request.set_authority(Some(&parsed_url.authority))
+    outgoing_request
+        .set_authority(Some(&parsed_url.authority))
         .map_err(|_| anyhow::anyhow!("Failed to set authority"))?;
-    
+
     // Set the path and query
-    outgoing_request.set_path_with_query(Some(&parsed_url.path_and_query))
+    outgoing_request
+        .set_path_with_query(Some(&parsed_url.path_and_query))
         .map_err(|_| anyhow::anyhow!("Failed to set path"))?;
 
-    log(Level::Info, "", &format!("📤 Sending HTTP request to {}", url));
+    log(
+        Level::Info,
+        "",
+        &format!("📤 Sending HTTP request to {}", url),
+    );
 
     // Send the request
     let future_response = outgoing_handler::handle(outgoing_request, None)
@@ -326,7 +339,11 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
         ));
     }
 
-    log(Level::Info, "", &format!("✅ Received response with status: {}", status));
+    log(
+        Level::Info,
+        "",
+        &format!("✅ Received response with status: {}", status),
+    );
 
     // Read the response body
     let response_body = incoming_response
@@ -343,11 +360,19 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
             Ok(chunk) if chunk.is_empty() => break,
             Ok(chunk) => data.extend_from_slice(&chunk),
             Err(StreamError::Closed) => break,
-            Err(e) => return Err(anyhow::anyhow!("Stream error while reading response: {e:?}")),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "Stream error while reading response: {e:?}"
+                ))
+            }
         }
     }
 
-    log(Level::Info, "", &format!("📦 Downloaded {} bytes from URL", data.len()));
+    log(
+        Level::Info,
+        "",
+        &format!("📦 Downloaded {} bytes from URL", data.len()),
+    );
 
     Ok(data)
 }
@@ -396,29 +421,6 @@ fn extract_filename_from_url(url: &str) -> String {
         .unwrap_or_else(|| "downloaded_attachment".to_string())
 }
 
-/// Attempts to guess content type from filename extension
-fn guess_content_type(filename: &str) -> String {
-    let extension = filename.split('.').last().unwrap_or("");
-    
-    match extension.to_lowercase().as_str() {
-        "pdf" => "application/pdf",
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "gif" => "image/gif",
-        "txt" => "text/plain",
-        "html" | "htm" => "text/html",
-        "json" => "application/json",
-        "xml" => "application/xml",
-        "zip" => "application/zip",
-        "doc" => "application/msword",
-        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "xls" => "application/vnd.ms-excel",
-        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        _ => "application/octet-stream",
-    }
-    .to_string()
-}
-
 fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Message> {
     let json: Value = serde_json::from_str(body_content)?;
 
@@ -436,86 +438,86 @@ fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Messag
 
     let mut attachments: Option<Vec<Attachment>> = None;
 
-    // Handle Local File Attachment (Guest reads file -> sends bytes)
-    // NOTE: This component requires wasi:filesystem access to the path provided.
-    if let Some(path_val) = json.get("attachment_path").and_then(|v| v.as_str()) {
-        log(
-            Level::Info,
-            "",
-            &format!("📎 Reading attachment from filesystem: {}", path_val),
-        );
+    // Handle URL Attachment(s) - Download from URL using WASI HTTP outgoing handler
+    if let Some(attachments_val) = json.get("attachments") {
+        // Support array of attachment objects with url and optional content_type
+        if let Some(attachments_array) = attachments_val.as_array() {
+            let mut attachment_list = Vec::new();
 
-        let filename = std::path::Path::new(path_val)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "attachment.bin".to_string());
+            for attachment_obj in attachments_array {
+                let url = attachment_obj
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("Missing 'url' in attachment object"))?;
 
-        // Read the file bytes directly inside the guest
-        let content = fs::read(path_val)
-            .with_context(|| format!("Failed to read attachment at path: {}", path_val))?;
+                log(
+                    Level::Info,
+                    "",
+                    &format!("🌐 Fetching attachment from URL: {}", url),
+                );
 
-        log(Level::Info, "", &format!("📎 Read {} bytes", content.len()));
+                // Download the file from the URL
+                let content = download_from_url(url)
+                    .with_context(|| format!("Failed to download attachment from URL: {}", url))?;
 
-        let content_type = guess_content_type(&filename);
+                // Use provided filename or extract from URL
+                let filename = attachment_obj
+                    .get("filename")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| extract_filename_from_url(url));
 
-        attachments = Some(vec![Attachment {
-            filename,
-            content_type,
-            content, 
-        }]);
-    }
+                // Use provided content_type or default to octet-stream
+                let content_type = attachment_obj
+                    .get("content_type")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    // Handle URL Attachment - Download from URL using WASI HTTP outgoing handler
-    if let Some(url_val) = json.get("attachment_url").and_then(|v| v.as_str()) {
-        log(
-            Level::Info,
-            "",
-            &format!("🌐 Fetching attachment from URL: {}", url_val)
-        );
+                log(
+                    Level::Info,
+                    "",
+                    &format!(
+                        "📎 Downloaded {} bytes as '{}' ({})",
+                        content.len(),
+                        filename,
+                        content_type
+                    ),
+                );
 
-        // Download the file from the URL
-        let content = download_from_url(url_val)
-            .with_context(|| format!("Failed to download attachment from URL: {}", url_val))?;
+                attachment_list.push(Attachment {
+                    filename,
+                    content_type,
+                    content,
+                });
+            }
 
-        let filename = extract_filename_from_url(url_val);
-        let content_type = guess_content_type(&filename);
-
-        log(
-            Level::Info,
-            "",
-            &format!("📎 Downloaded {} bytes as '{}'", content.len(), filename)
-        );
-
-        // If we already have an attachment from file path, add this as a second attachment
-        if let Some(ref mut existing_attachments) = attachments {
-            existing_attachments.push(Attachment {
-                filename,
-                content_type,
-                content,
-            });
-        } else {
-            attachments = Some(vec![Attachment {
-                filename,
-                content_type,
-                content,
-            }]);
+            if !attachment_list.is_empty() {
+                attachments = Some(attachment_list);
+            }
         }
     }
 
-    // Helper to parse lists
+    // Helper to parse email lists
     let parse_list = |key: &str| -> Option<Vec<String>> {
         json.get(key).and_then(|v| {
             let mut emails = Vec::new();
             if v.is_array() {
                 if let Some(arr) = v.as_array() {
                     for item in arr {
-                        if let Some(s) = item.as_str() { emails.push(s.to_string()); }
+                        if let Some(s) = item.as_str() {
+                            emails.push(s.to_string());
+                        }
                     }
                 }
             } else if let Some(s) = v.as_str() {
                 emails.push(s.to_string());
             }
-            if emails.is_empty() { None } else { Some(emails) }
+            if emails.is_empty() {
+                None
+            } else {
+                Some(emails)
+            }
         })
     };
 
