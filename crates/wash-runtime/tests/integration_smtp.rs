@@ -13,7 +13,7 @@ use wash_runtime::{
         HostApi, HostBuilder,
         http::{DevRouter, HttpServer},
     },
-    plugin::{wasi_config::WasiConfig, wasi_logging::WasiLogging, wasmcloud_smtp::WasmcloudSmtp},
+    plugin::{smtp::BettySmtp, wasi_config::WasiConfig, wasi_logging::WasiLogging},
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::WitInterface,
 };
@@ -33,7 +33,7 @@ async fn test_smtp_demo_integration() -> Result<()> {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let http_handler = DevRouter::default();
     let http_plugin = HttpServer::new(http_handler, addr);
-    let smtp_plugin = WasmcloudSmtp::new();
+    let smtp_plugin = BettySmtp::new();
     let logging_plugin = WasiLogging {};
     let config_plugin = WasiConfig::default();
 
@@ -93,7 +93,7 @@ async fn test_smtp_demo_integration() -> Result<()> {
                     config: HashMap::new(),
                 },
                 WitInterface {
-                    namespace: "wasmcloud".to_string(),
+                    namespace: "bettyblocks".to_string(),
                     package: "smtp".to_string(),
                     interfaces: ["client".to_string()].into_iter().collect(),
                     version: Some(semver::Version::parse("0.2.0").unwrap()),
@@ -329,7 +329,7 @@ async fn test_smtp_attachments_url() -> Result<()> {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let http_handler = DevRouter::default();
     let http_plugin = HttpServer::new(http_handler, addr);
-    let smtp_plugin = WasmcloudSmtp::new();
+    let smtp_plugin = BettySmtp::new();
     let logging_plugin = WasiLogging {};
     let config_plugin = WasiConfig::default();
 
@@ -384,7 +384,7 @@ async fn test_smtp_attachments_url() -> Result<()> {
                     config: HashMap::new(),
                 },
                 WitInterface {
-                    namespace: "wasmcloud".to_string(),
+                    namespace: "bettyblocks".to_string(),
                     package: "smtp".to_string(),
                     interfaces: ["client".to_string()].into_iter().collect(),
                     version: Some(semver::Version::parse("0.2.0").unwrap()),

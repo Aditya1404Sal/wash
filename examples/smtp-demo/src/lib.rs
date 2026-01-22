@@ -8,6 +8,7 @@ mod bindings {
 }
 
 use bindings::{
+    bettyblocks::smtp::client::{Attachment, Credentials, Message, Recipient, Sender, SmtpClient},
     exports::wasi::http::incoming_handler::Guest,
     wasi::{
         http::outgoing_handler,
@@ -18,7 +19,6 @@ use bindings::{
         io::streams::StreamError,
         logging::logging::{log, Level},
     },
-    wasmcloud::smtp::client::{Attachment, Credentials, Message, Recipient, Sender, SmtpClient},
 };
 use serde_json::Value;
 

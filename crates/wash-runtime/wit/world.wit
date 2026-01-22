@@ -31,5 +31,5 @@ world messaging {
 }
 
 world smtp{
-    import wasmcloud:smtp/client@0.2.0;
+    import bettyblocks:smtp/client@0.2.0;
 }

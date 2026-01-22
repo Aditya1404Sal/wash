@@ -1,4 +1,4 @@
-package wasmcloud:smtp@0.2.0;
+package bettyblocks:smtp@0.2.0;
 
 interface client {
     /// Configuration for establishing a secure SMTP connection.
@@ -15,7 +15,7 @@ interface client {
 
     /// Email sender information
     record sender {
-        /// bacause "from" is a keyword in some languages, we rename for clarity or keep % escape
+        /// because "from" is a keyword in some languages, we rename for clarity or keep % escape
         address: string,
         reply-to: option<string>,
         /// Optional display name (e.g., "Support Team <support@example.com>")
