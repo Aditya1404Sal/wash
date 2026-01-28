@@ -47,7 +47,6 @@ pub struct SharedTransport {
 #[derive(Clone)]
 pub struct SmtpClientData {
     pub connection_key: String,
-    pub client_id: String,
 }
 
 /// SMTP host plugin (with connection pooling)
@@ -162,7 +161,7 @@ impl BettySmtp {
             return Ok(connection_key);
         }
 
-        // Create new transport (using entry API to avoid race conditions)
+        // Create new transport
         let transport = Self::build_transport(credentials)?;
 
         // Test the connection
@@ -185,7 +184,7 @@ impl BettySmtp {
             connection_key: connection_key.clone(),
         };
 
-        // Insert only if not already present (handles race condition)
+        // Insert only if not already present
         self.transport_pool
             .entry(connection_key.clone())
             .or_insert(shared_transport);
@@ -292,7 +291,6 @@ impl bindings::bettyblocks::smtp::client::HostSmtpClient for Ctx {
 
         let client_data = SmtpClientData {
             connection_key: connection_key.clone(),
-            client_id: client_id.clone(),
         };
 
         workload_clients.insert(client_id.clone(), client_data);
