@@ -146,7 +146,6 @@ wasmtime-wasi-http = { version = "38", default-features = false }
 which = { version = "6.0.3", default-features = false }
 wit-component = { version = "0.235.0", default-features = false }
 wash-runtime = { path = "crates/wash-runtime", default-features = false }
-wat = { version = "1.239.0", default-features = false, features = ["component-model"]}
 
 [build-dependencies]
 anyhow = { workspace = true, default-features = true }

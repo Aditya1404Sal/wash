@@ -19,7 +19,7 @@ wasi-config = []
 wasi-logging = []
 wasi-blobstore = []
 wasi-keyvalue = []
-wasmcloud-smtp = ["dep:lettre"]
+wasmcloud-smtp = ["dep:lettre", "dep:html2text"]
 wasi-webgpu = ["dep:wasi-webgpu-wasmtime", "dep:wasi-graphics-context-wasmtime"]
 
 [dependencies]
@@ -32,6 +32,7 @@ dashmap = { version = "6.0"}
 futures = { workspace = true }
 hostname = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1"] }
+html2text = { version = "0.14", default-features = false, optional = true }
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "hostname", "pool"], optional = true }
 reqwest = { workspace = true }
 names = { workspace = true }

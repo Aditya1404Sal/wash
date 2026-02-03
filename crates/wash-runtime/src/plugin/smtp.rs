@@ -1,14 +1,14 @@
+use dashmap::DashMap;
+use html2text::from_read;
+use lettre::{
+    AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
+    message::{Attachment, MultiPart, header::ContentType},
+    transport::smtp::authentication::Credentials as LettreCredentials,
+};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::{collections::HashSet, sync::Arc};
 
-use dashmap::DashMap;
-use lettre::{
-    AsyncSmtpTransport, AsyncTransport, Message as LettreMessage, Tokio1Executor,
-    message::{Attachment, MultiPart, SinglePart, header::ContentType},
-    transport::smtp::{
-        authentication::Credentials as LettreCredentials,
-        client::{Tls, TlsParameters},
-    },
-};
 use wasmtime::component::{HasSelf, Resource};
 
 use crate::{
@@ -17,7 +17,14 @@ use crate::{
     wit::{WitInterface, WitWorld},
 };
 
-const BETTYBLOCKS_SMTP_ID: &str = "bettyblocks-smtp";
+use bindings::bettyblocks::smtp::client::{
+    Credentials, Host, HostSmtpClient, Message, SendResult, TlsMode, add_to_linker,
+};
+
+const BETTYBLOCKS_SMTP_PLUGIN_ID: &str = "bettyblocks-smtp";
+const PLAIN_TEXT_WIDTH: usize = 80;
+const MAX_POOLED_CONNECTIONS: u32 = 5;
+const MIN_IDLE_CONNECTIONS: u32 = 0;
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -31,41 +38,27 @@ mod bindings {
     });
 }
 
-/// Wasmtime Resource handle that represents an SMTP client connection
+/// Wasmtime Resource handle that represents an SMTP client connection.(this is the connection_key)
 pub type SmtpClientHandle = String;
 
-/// Shared transport pool - multiple "clients" can reference the same transport
-/// the connection key is the Hash of host:port:username to identify unique connections
 #[derive(Clone)]
 pub struct SharedTransport {
     pub transport: Arc<AsyncSmtpTransport<Tokio1Executor>>,
-    pub credentials: bindings::bettyblocks::smtp::client::Credentials,
+    pub credentials: Credentials,
     pub created_at: u64,
+    /// The connection key is the hash of host:port:username:password to identify unique connections
     pub connection_key: String,
 }
 
-#[derive(Clone)]
-pub struct SmtpClientData {
-    pub connection_key: String,
-}
-
-/// SMTP host plugin (with connection pooling)
 #[derive(Clone, Default)]
 pub struct BettySmtp {
-    /// Shared transport pool - one transport per unique server configuration
-    /// Key: connection_key (hash of host:port:username)
     transport_pool: Arc<DashMap<String, SharedTransport>>,
-
-    /// Per-workload client references
-    /// Key: workload_id -> (client_id -> client data)
-    clients: Arc<DashMap<String, DashMap<String, SmtpClientData>>>,
 }
 
 impl BettySmtp {
     pub fn new() -> Self {
         Self {
             transport_pool: Arc::new(DashMap::new()),
-            clients: Arc::new(DashMap::new()),
         }
     }
 
@@ -76,81 +69,55 @@ impl BettySmtp {
             .as_secs()
     }
 
-    /// Generate a unique connection key based on server configuration
-    /// Multiple clients with same config will share the same transport
-    fn generate_connection_key(
-        credentials: &bindings::bettyblocks::smtp::client::Credentials,
-    ) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
+    fn generate_connection_key(credentials: &Credentials) -> String {
         let mut hasher = DefaultHasher::new();
         credentials.host.hash(&mut hasher);
         credentials.port.hash(&mut hasher);
         credentials.username.hash(&mut hasher);
         credentials.password.hash(&mut hasher);
-        credentials.implicit_tls.hash(&mut hasher);
+        match credentials.tls_mode {
+            TlsMode::None => 0u8.hash(&mut hasher),
+            TlsMode::Starttls => 1u8.hash(&mut hasher),
+            TlsMode::Implicit => 2u8.hash(&mut hasher),
+        }
 
         format!("conn-{:x}", hasher.finish())
     }
 
-    fn generate_client_id() -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        let timestamp = Self::get_timestamp();
-        timestamp.hash(&mut hasher);
-        uuid::Uuid::new_v4().hash(&mut hasher);
-
-        format!("client-{:x}", hasher.finish())
-    }
-
     fn build_transport(
-        credentials: &bindings::bettyblocks::smtp::client::Credentials,
+        credentials: &Credentials,
     ) -> anyhow::Result<AsyncSmtpTransport<Tokio1Executor>> {
-        let tls_builder = TlsParameters::builder(credentials.host.clone());
-        let tls_parameters = tls_builder.build()?;
-
-        let mut builder = match credentials.implicit_tls {
-            true => AsyncSmtpTransport::<Tokio1Executor>::relay(&credentials.host)?,
-            false => AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&credentials.host)?,
+        let mut builder = match credentials.tls_mode {
+            TlsMode::Implicit => AsyncSmtpTransport::<Tokio1Executor>::relay(&credentials.host)?,
+            TlsMode::Starttls => {
+                AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&credentials.host)?
+            }
+            TlsMode::None => {
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&credentials.host)
+            }
         };
-
-        let tls_mode = if credentials.implicit_tls {
-            Tls::Wrapper(tls_parameters)
-        } else {
-            Tls::Required(tls_parameters)
-        };
-
-        builder = builder.tls(tls_mode);
 
         if let Some(custom_port) = credentials.port {
             builder = builder.port(custom_port);
         }
 
-        builder = builder.credentials(LettreCredentials::new(
-            credentials.username.clone(),
-            credentials.password.clone(),
-        ));
+        if let (Some(username), Some(password)) = (&credentials.username, &credentials.password) {
+            builder =
+                builder.credentials(LettreCredentials::new(username.clone(), password.clone()));
+        }
 
         Ok(builder
             .pool_config(
                 lettre::transport::smtp::PoolConfig::new()
-                    .max_size(20)
-                    .min_idle(5),
+                    .max_size(MAX_POOLED_CONNECTIONS)
+                    .min_idle(MIN_IDLE_CONNECTIONS),
             )
             .build())
     }
 
-    /// Get or create a shared transport for the given credentials
-    async fn get_or_create_transport(
-        &self,
-        credentials: &bindings::bettyblocks::smtp::client::Credentials,
-    ) -> anyhow::Result<String> {
+    async fn get_or_create_transport(&self, credentials: &Credentials) -> anyhow::Result<String> {
         let connection_key = Self::generate_connection_key(credentials);
 
-        // Check if transport already exists
         if self.transport_pool.contains_key(&connection_key) {
             tracing::debug!(
                 connection_key = connection_key,
@@ -161,10 +128,8 @@ impl BettySmtp {
             return Ok(connection_key);
         }
 
-        // Create new transport
         let transport = Self::build_transport(credentials)?;
 
-        // Test the connection
         transport
             .test_connection()
             .await
@@ -184,7 +149,6 @@ impl BettySmtp {
             connection_key: connection_key.clone(),
         };
 
-        // Insert only if not already present
         self.transport_pool
             .entry(connection_key.clone())
             .or_insert(shared_transport);
@@ -196,7 +160,7 @@ impl BettySmtp {
 #[async_trait::async_trait]
 impl HostPlugin for BettySmtp {
     fn id(&self) -> &'static str {
-        BETTYBLOCKS_SMTP_ID
+        BETTYBLOCKS_SMTP_PLUGIN_ID
     }
 
     fn world(&self) -> WitWorld {
@@ -229,16 +193,13 @@ impl HostPlugin for BettySmtp {
         );
         let linker = component.linker();
 
-        bindings::bettyblocks::smtp::client::add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx)?;
+        add_to_linker::<_, HasSelf<Ctx>>(linker, |ctx| ctx)?;
 
         let id = component.workload_id();
         tracing::debug!(
             workload_id = id,
             "Successfully added SMTP interface to linker for workload"
         );
-
-        // Initialize client storage for this workload
-        self.clients.insert(id.to_string(), DashMap::new());
 
         tracing::debug!("BettySmtp plugin bound to workload '{id}'");
 
@@ -250,12 +211,10 @@ impl HostPlugin for BettySmtp {
         workload_id: &str,
         _interfaces: HashSet<crate::wit::WitInterface>,
     ) -> anyhow::Result<()> {
-        // Clean up client references for this workload
-        self.clients.remove(workload_id);
-
         // Note: We don't remove transports from the pool here
         // They can be reused by other workloads with the same configuration
         // Transports will be cleaned up when the plugin is dropped
+        // Use disconnect to explicitly remove the transports.
 
         tracing::debug!("BettySmtp plugin unbound from workload '{workload_id}'");
 
@@ -264,16 +223,15 @@ impl HostPlugin for BettySmtp {
 }
 
 // Resource host trait implementation for smtp-client
-impl bindings::bettyblocks::smtp::client::HostSmtpClient for Ctx {
+impl HostSmtpClient for Ctx {
     async fn connect(
         &mut self,
-        credentials: bindings::bettyblocks::smtp::client::Credentials,
+        credentials: Credentials,
     ) -> anyhow::Result<Result<Resource<SmtpClientHandle>, String>> {
-        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_ID) else {
+        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) else {
             return Ok(Err("SMTP plugin not available".to_string()));
         };
 
-        // Get or create shared transport
         let connection_key = match plugin.get_or_create_transport(&credentials).await {
             Ok(key) => key,
             Err(e) => {
@@ -281,72 +239,45 @@ impl bindings::bettyblocks::smtp::client::HostSmtpClient for Ctx {
             }
         };
 
-        // Generate unique client ID
-        let client_id = BettySmtp::generate_client_id();
-
-        // Store client reference
-        let Some(workload_clients) = plugin.clients.get(&self.workload_id.to_string()) else {
-            return Ok(Err(format!("Workload '{}' not found", self.workload_id)));
-        };
-
-        let client_data = SmtpClientData {
-            connection_key: connection_key.clone(),
-        };
-
-        workload_clients.insert(client_id.clone(), client_data);
-
         tracing::debug!(
             workload_id = self.workload_id.to_string(),
-            client_id = client_id,
             connection_key = connection_key,
             host = credentials.host,
             port = credentials.port,
             "SMTP client connected (using shared transport)"
         );
 
-        let resource = self.table.push(client_id)?;
+        let resource = self.table.push(connection_key)?;
         Ok(Ok(resource))
     }
 
     async fn send(
         &mut self,
         client: Resource<SmtpClientHandle>,
-        message: bindings::bettyblocks::smtp::client::Message,
-    ) -> anyhow::Result<Result<bindings::bettyblocks::smtp::client::SendResult, String>> {
-        let client_id = self.table.get(&client)?;
+        message: Message,
+    ) -> anyhow::Result<Result<SendResult, String>> {
+        let connection_key = self.table.get(&client)?;
 
-        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_ID) else {
+        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) else {
             return Ok(Err("SMTP plugin not available".to_string()));
         };
 
-        let connection_key = {
-            let Some(workload_clients) = plugin.clients.get(&self.workload_id.to_string()) else {
-                return Ok(Err(format!("Workload '{}' not found", self.workload_id)));
-            };
-
-            let Some(client_data) = workload_clients.get(client_id) else {
-                return Ok(Err(format!("SMTP client '{client_id}' not found")));
-            };
-
-            client_data.connection_key.clone()
-        };
-
-        let Some(shared_transport) = plugin.transport_pool.get(&connection_key) else {
+        let Some(shared_transport) = plugin.transport_pool.get(connection_key) else {
             return Ok(Err(format!(
                 "SMTP transport '{}' not found",
                 connection_key
             )));
         };
 
-        let mut email_builder = LettreMessage::builder()
+        let mut email_builder = lettre::Message::builder()
             .from(
                 message
                     .sender
-                    .address
+                    .from
                     .parse()
                     .map_err(|e| anyhow::Error::msg(format!("invalid sender address: {e}")))?,
             )
-            .subject(message.subject);
+            .subject(message.subject.clone());
 
         if let Some(reply_to) = message.sender.reply_to {
             email_builder = email_builder.reply_to(
@@ -380,37 +311,36 @@ impl bindings::bettyblocks::smtp::client::HostSmtpClient for Ctx {
             }
         }
 
-        let email = if let Some(attachments) = message.attachments {
-            let mut multipart = MultiPart::mixed().singlepart(
-                SinglePart::builder()
-                    .header(ContentType::TEXT_HTML)
-                    .body(message.body),
+        let plain_text = from_read(message.body.as_bytes(), PLAIN_TEXT_WIDTH).unwrap_or_else(|e| {
+            tracing::warn!(
+                "Failed to convert HTML to plain text: {}, using empty string",
+                e
             );
+            String::new()
+        });
 
+        let mut multipart = MultiPart::mixed()
+            .multipart(MultiPart::alternative_plain_html(plain_text, message.body));
+
+        if let Some(attachments) = message.attachments {
             for attachment in attachments {
                 let content_type = ContentType::parse(&attachment.content_type)
                     .unwrap_or(ContentType::parse("application/octet-stream").unwrap());
 
-                let attachment_part =
+                let attachment =
                     Attachment::new(attachment.filename).body(attachment.content, content_type);
 
-                multipart = multipart.singlepart(attachment_part);
+                multipart = multipart.singlepart(attachment);
             }
+        }
 
-            email_builder.multipart(multipart).map_err(|e| {
-                anyhow::Error::msg(format!("failed to build email with attachments: {e}"))
-            })?
-        } else {
-            email_builder
-                .header(ContentType::TEXT_HTML)
-                .body(message.body)
-                .map_err(|e| anyhow::Error::msg(format!("failed to build email: {e}")))?
-        };
+        let email = email_builder
+            .multipart(multipart)
+            .map_err(|e| anyhow::Error::msg(format!("failed to build email: {e}")))?;
 
         tracing::info!(
             workload_id = %self.workload_id,
-            client_id = %client_id,
-            connection_key = ?connection_key,
+            connection_key = %connection_key,
             "Sending email via shared SMTP transport"
         );
 
@@ -430,10 +360,10 @@ impl bindings::bettyblocks::smtp::client::HostSmtpClient for Ctx {
                 };
 
                 let effective_port = shared_transport.credentials.port.unwrap_or(
-                    if shared_transport.credentials.implicit_tls {
-                        465
-                    } else {
-                        587
+                    match shared_transport.credentials.tls_mode {
+                        TlsMode::Implicit => 465,
+                        TlsMode::Starttls => 587,
+                        TlsMode::None => 25,
                     },
                 );
 
@@ -442,7 +372,7 @@ impl bindings::bettyblocks::smtp::client::HostSmtpClient for Ctx {
                     shared_transport.credentials.host, effective_port
                 ));
 
-                Ok(Ok(bindings::bettyblocks::smtp::client::SendResult {
+                Ok(Ok(SendResult {
                     accepted: true,
                     server: server_addr,
                     message_id: message_id_opt,
@@ -459,57 +389,54 @@ impl bindings::bettyblocks::smtp::client::HostSmtpClient for Ctx {
         }
     }
 
+    // Removes the transport from the pool to force disconnect
     async fn disconnect(
         &mut self,
         client: Resource<SmtpClientHandle>,
     ) -> anyhow::Result<Result<(), String>> {
-        let client_id = self.table.get(&client)?;
+        let connection_key = self.table.get(&client)?;
 
-        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_ID) else {
+        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) else {
             return Ok(Err("SMTP plugin not available".to_string()));
         };
 
-        let Some(workload_clients) = plugin.clients.get(&self.workload_id.to_string()) else {
-            return Ok(Err(format!("Workload '{}' not found", self.workload_id)));
-        };
-
-        if let Some((_, client_data)) = workload_clients.remove(client_id) {
+        if plugin.transport_pool.remove(connection_key).is_some() {
             tracing::debug!(
                 workload_id = self.workload_id.to_string(),
-                client_id = client_id,
-                connection_key = client_data.connection_key,
-                "SMTP client disconnected (shared transport remains in pool)"
+                connection_key = connection_key,
+                "SMTP transport forcefully disconnected and removed from pool"
             );
             Ok(Ok(()))
         } else {
-            Ok(Err(format!("SMTP client '{client_id}' not found")))
+            tracing::warn!(
+                workload_id = self.workload_id.to_string(),
+                connection_key = connection_key,
+                "SMTP transport not found in pool (may have already been disconnected)"
+            );
+            Ok(Ok(()))
         }
     }
 
     async fn drop(&mut self, rep: Resource<SmtpClientHandle>) -> anyhow::Result<()> {
-        let client_id = self.table.get(&rep)?;
+        let connection_key = self.table.get(&rep)?;
 
         tracing::debug!(
             workload_id = self.workload_id.to_string(),
-            client_id = client_id,
-            resource_id = ?rep,
-            "Dropping SMTP client resource"
+            connection_key = connection_key,
+            "Dropping SMTP client resource (transport remains in pool for reuse)"
         );
 
-        let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_ID) else {
-            return Ok(());
-        };
-
-        if let Some(workload_clients) = plugin.clients.get(&self.workload_id.to_string()) {
-            workload_clients.remove(client_id);
-        }
+        // Note: we intentionally do NOT remove the transport from the pool here.
+        // this allows connection pooling where subsequent requests with the same
+        // credentials will reuse the existing transport.
+        // Use disconnect() to explicitly close and remove the connection.
 
         self.table.delete(rep)?;
         Ok(())
     }
 }
 
-impl bindings::bettyblocks::smtp::client::Host for Ctx {}
+impl Host for Ctx {}
 
 #[cfg(test)]
 mod tests {
@@ -519,25 +446,24 @@ mod tests {
     fn test_smtp_plugin_creation() {
         let smtp = BettySmtp::new();
         assert_eq!(smtp.transport_pool.len(), 0);
-        assert_eq!(smtp.clients.len(), 0);
     }
 
     #[test]
     fn test_connection_key_consistency() {
-        let creds1 = bindings::bettyblocks::smtp::client::Credentials {
+        let creds1 = Credentials {
             host: "smtp.gmail.com".to_string(),
             port: None,
-            username: "test@gmail.com".to_string(),
-            password: "password".to_string(),
-            implicit_tls: true,
+            username: Some("test@gmail.com".to_string()),
+            password: Some("password".to_string()),
+            tls_mode: TlsMode::Implicit,
         };
 
-        let creds2 = bindings::bettyblocks::smtp::client::Credentials {
+        let creds2 = Credentials {
             host: "smtp.gmail.com".to_string(),
             port: None,
-            username: "test@gmail.com".to_string(),
-            password: "password".to_string(),
-            implicit_tls: true,
+            username: Some("test@gmail.com".to_string()),
+            password: Some("password".to_string()),
+            tls_mode: TlsMode::Implicit,
         };
 
         let key1 = BettySmtp::generate_connection_key(&creds1);

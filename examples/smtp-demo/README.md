@@ -1,11 +1,9 @@
 # SMTP Email Component
 
-A WebAssembly component that sends emails via SMTP with support for attachments downloaded from URLs, connection pooling, and automatic TLS configuration.
+A WebAssembly component that sends emails via SMTP with support for attachments downloaded from URLs and automatic TLS configuration.
 
 ## Features
 
--  **Connection Pooling**: Reuses SMTP connections across requests for better performance
--  **Automatic TLS Detection**: Auto-selects Implicit TLS (SSL) for port 465, Explicit TLS (STARTTLS) for ports 587/25/2525
 -  **URL-based Attachments**: Downloads files from URLs and attaches them to emails
 -  **Multiple Recipients**: Supports To, CC, and BCC fields
 -  **Flexible Configuration**: Configure SMTP server, credentials, and email content via JSON

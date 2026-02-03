@@ -1,28 +1,29 @@
 package bettyblocks:smtp@0.2.0;
 
 interface client {
-    /// Configuration for establishing a secure SMTP connection.
-    /// Note: TLS is strictly enforced; plaintext connections are not supported.
     record credentials {
         host: string,
         port: option<u16>,
-        username: string,
-        password: string,
-        /// If true, use Implicit TLS (port 465). Connection is encrypted immediately.
-        /// If false, uses Explicit TLS (STARTTLS port 587). Connection upgrades to TLS immediately after connection.
-        implicit-tls: bool,
+        username: option<string>,
+        password: option<string>,
+        /// - none: No TLS (plaintext, port 25).
+        /// - starttls: Explicit TLS via STARTTLS (port 587)
+        /// - implicit: Implicit TLS (port 465).
+        tls-mode: tls-mode,
     }
 
-    /// Email sender information
+    enum tls-mode {
+        none,
+        starttls,
+        implicit,
+    }
+
     record sender {
-        /// because "from" is a keyword in some languages, we rename for clarity or keep % escape
-        address: string,
+        %from: string,
         reply-to: option<string>,
-        /// Optional display name (e.g., "Support Team <support@example.com>")
         name: option<string>,
     }
 
-    /// Email recipients
     record recipient {
         to: list<string>,
         cc: option<list<string>>,
@@ -31,25 +32,18 @@ interface client {
 
     record attachment {
         filename: string,
-        /// Content type (e.g., "application/pdf")
         content-type: string,
-        /// Raw file content bytes. 
-        /// This is safer than passing a path, as it prevents the provider 
-        /// from reading host files the actor shouldn't access.
         content: list<u8>,
     }
 
-    /// Email message to send
     record message {
         sender: sender,
         recipient: recipient,
         subject: string,
-        /// HTML body content
         body: string,
         attachments: option<list<attachment>>,
     }
 
-    /// Result of sending an email
     record send-result {
         accepted: bool,
         server: option<string>,
@@ -57,16 +51,8 @@ interface client {
     }
 
     resource smtp-client {
-        /// Create and connect to an SMTP server
-        /// Returns a client handle or error if connection fails
         connect: static func(creds: credentials) -> result<smtp-client, string>;
-
-        /// Send an email through this SMTP connection
         send: func(msg: message) -> result<send-result, string>;
-
-        /// Explicitly close the connection. 
-        /// Note: Resources are automatically cleaned up when dropped, 
-        /// but this allows handling closure errors explicitly.
         disconnect: func() -> result<_, string>;
     }
 }

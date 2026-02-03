@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use std::sync::{Mutex, OnceLock};
+use serde::Deserialize;
+use serde_json::Value;
 
 mod bindings {
     wit_bindgen::generate!({
@@ -8,7 +9,7 @@ mod bindings {
 }
 
 use bindings::{
-    bettyblocks::smtp::client::{Attachment, Credentials, Message, Recipient, Sender, SmtpClient},
+    bettyblocks::smtp::client::{Attachment, Credentials, Message, Recipient, Sender, SmtpClient, TlsMode},
     exports::wasi::http::incoming_handler::Guest,
     wasi::{
         http::outgoing_handler,
@@ -20,26 +21,18 @@ use bindings::{
         logging::logging::{log, Level},
     },
 };
-use serde_json::Value;
 
 struct Component;
-
-enum SmtpClientState {
-    Connected(SmtpClient),
-    Failed(String),
-}
-
-static SMTP_CLIENT: OnceLock<Mutex<Option<SmtpClientState>>> = OnceLock::new();
 
 impl Guest for Component {
     fn handle(request: IncomingRequest, response_out: ResponseOutparam) {
         match handle_request(request) {
             Ok(message) => {
-                log(Level::Info, "", &format!("✅ {}", message));
+                log(Level::Info, "", &format!("{}", message));
                 send_response(response_out, 200, message.as_bytes());
             }
             Err(e) => {
-                log(Level::Error, "", &format!("❌ Error: {e}"));
+                log(Level::Error, "", &format!("Error: {e}"));
                 let error_msg = format!("Failed to send email: {e}");
                 send_response(response_out, 500, error_msg.as_bytes());
             }
@@ -48,56 +41,15 @@ impl Guest for Component {
 }
 
 fn handle_request(request: IncomingRequest) -> Result<String> {
-    log(Level::Info, "", "📧 Processing incoming SMTP request");
+    log(Level::Info, "", "Processing incoming SMTP request");
 
     let body_content = read_request_body(request)?;
 
-    // Parse the request to extract SMTP credentials
-    let smtp_config = parse_smtp_config(&body_content)?;
+    let smtp_config: SmtpConfig = serde_json::from_str(&body_content)
+        .context("Request body must be valid JSON with SMTP configuration")?;
 
-    // Handle Connection Pooling
-    let client_mutex = SMTP_CLIENT.get_or_init(|| Mutex::new(None));
-    let mut client_state = client_mutex
-        .lock()
-        .map_err(|e| anyhow::anyhow!("Failed to acquire lock: {e}"))?;
+    let client = connect_smtp(&smtp_config)?;
 
-    // Connect if not already connected
-    if client_state.is_none() {
-        log(Level::Info, "", "🔌 Initializing SMTP client connection");
-
-        match try_connect_smtp(&smtp_config) {
-            Ok(client) => {
-                log(
-                    Level::Info,
-                    "",
-                    "✅ SMTP connection established with pooling",
-                );
-                *client_state = Some(SmtpClientState::Connected(client));
-            }
-            Err(e) => {
-                let error_msg = format!("{e}");
-                log(
-                    Level::Error,
-                    "",
-                    &format!("❌ Connection failed: {}", error_msg),
-                );
-                *client_state = Some(SmtpClientState::Failed(error_msg.clone()));
-                return Err(anyhow::anyhow!(error_msg));
-            }
-        }
-    }
-
-    // Retrieve client from state
-    let client = match client_state.as_ref() {
-        Some(SmtpClientState::Connected(client)) => client,
-        Some(SmtpClientState::Failed(error)) => {
-            // Retry logic could go here, but for now we fail fast
-            return Err(anyhow::anyhow!("Previous connection failed: {}", error));
-        }
-        None => return Err(anyhow::anyhow!("Client not initialized")),
-    };
-
-    // Build message (Downloads files from URLs if needed)
     let message = build_email_message(&body_content, &smtp_config)?;
 
     let attachment_info = if message.attachments.is_some() {
@@ -109,10 +61,9 @@ fn handle_request(request: IncomingRequest) -> Result<String> {
     log(
         Level::Info,
         "",
-        &format!("📨 Sending: {} {}", message.subject, attachment_info),
+        &format!("Sending: {} {}", message.subject, attachment_info),
     );
 
-    // Send via the Provider
     let result = client
         .send(&message)
         .map_err(|e| anyhow::anyhow!("Send failed: {e}"))?;
@@ -126,112 +77,69 @@ fn handle_request(request: IncomingRequest) -> Result<String> {
     ))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
 struct SmtpConfig {
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
+    smtp: SmtpCredentials,
     from: String,
-    to: Vec<String>,
+    to: ToRecipients,
 }
 
-fn parse_smtp_config(body_content: &str) -> Result<SmtpConfig> {
-    let json: Value = serde_json::from_str(body_content)
-        .context("Request body must be valid JSON with SMTP configuration")?;
-
-    // Parse SMTP credentials
-    let smtp = json
-        .get("smtp")
-        .ok_or_else(|| anyhow::anyhow!("Missing 'smtp' configuration object"))?;
-
-    let host = smtp
-        .get("host")
-        .and_then(|v| v.as_str())
-        .unwrap_or("smtp.gmail.com")
-        .to_string();
-
-    let port = smtp.get("port").and_then(|v| v.as_u64()).unwrap_or(465) as u16;
-
-    let username = smtp
-        .get("username")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'smtp.username'"))?
-        .to_string();
-
-    let password = smtp
-        .get("password")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'smtp.password'"))?
-        .to_string();
-
-    // Parse email addresses
-    let from = json
-        .get("from")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("Missing 'from' email address"))?
-        .to_string();
-
-    let to = if let Some(to_val) = json.get("to") {
-        let mut parsed = Vec::new();
-        if to_val.is_array() {
-            if let Some(arr) = to_val.as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() {
-                        parsed.push(s.to_string());
-                    }
-                }
-            }
-        } else if let Some(s) = to_val.as_str() {
-            parsed.push(s.to_string());
-        }
-        if parsed.is_empty() {
-            return Err(anyhow::anyhow!(
-                "'to' field must contain at least one email address"
-            ));
-        }
-        parsed
-    } else {
-        return Err(anyhow::anyhow!("Missing 'to' email address(es)"));
-    };
-
-    Ok(SmtpConfig {
-        host,
-        port,
-        username,
-        password,
-        from,
-        to,
-    })
+#[derive(Clone, Deserialize)]
+struct SmtpCredentials {
+    #[serde(default = "default_host")]
+    host: String,
+    #[serde(default = "default_port")]
+    port: u16,
+    username: Option<String>,
+    password: Option<String>,
 }
 
-fn try_connect_smtp(config: &SmtpConfig) -> Result<SmtpClient> {
-    // Automatic TLS Selection Logic
-    // Port 465 -> Implicit TLS (SSL)
-    // Port 587/25/2525 -> Explicit TLS (STARTTLS)
-    let implicit_tls = config.port == 465;
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+enum ToRecipients {
+    Single(String),
+    Multiple(Vec<String>),
+}
 
-    let tls_mode = if implicit_tls {
-        "Implicit (SSL)"
-    } else {
-        "Explicit (STARTTLS)"
+impl ToRecipients {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            ToRecipients::Single(s) => vec![s],
+            ToRecipients::Multiple(v) => v,
+        }
+    }
+}
+
+fn default_host() -> String {
+    "localhost".to_string()
+}
+
+fn default_port() -> u16 {
+    25
+}
+
+fn connect_smtp(config: &SmtpConfig) -> Result<SmtpClient> {
+    let (tls_mode, tls_mode_str) = match config.smtp.port {
+        465 => (TlsMode::Implicit, "Implicit (SSL)"),
+        25 => (TlsMode::None, "None (plaintext)"),
+        _ => (TlsMode::Starttls, "Explicit (STARTTLS)"),
     };
 
     log(
         Level::Info,
         "",
         &format!(
-            "🔄 Connecting to {}:{} using {}...",
-            config.host, config.port, tls_mode
+            "Connecting to {}:{} using {}...",
+            config.smtp.host, config.smtp.port, tls_mode_str
         ),
     );
 
     let creds = Credentials {
-        host: config.host.clone(),
-        port: Some(config.port),
-        username: config.username.clone(),
-        password: config.password.clone(),
-        implicit_tls,
+        host: config.smtp.host.clone(),
+        port: Some(config.smtp.port),
+        username: config.smtp.username.clone(),
+        password: config.smtp.password.clone(),
+        tls_mode,
     };
 
     match SmtpClient::connect(&creds) {
@@ -239,12 +147,12 @@ fn try_connect_smtp(config: &SmtpConfig) -> Result<SmtpClient> {
             log(
                 Level::Info,
                 "",
-                &format!("✅ Connected to {}:{}", config.host, config.port),
+                &format!("Connected to {}:{}", config.smtp.host, config.smtp.port),
             );
             Ok(client)
         }
         Err(e) => {
-            log(Level::Error, "", &format!("❌ Connection failed: {}", e));
+            log(Level::Error, "", &format!("Connection failed: {}", e));
             Err(anyhow::anyhow!("Failed to connect to SMTP server: {}", e))
         }
     }
@@ -272,37 +180,30 @@ fn read_request_body(request: IncomingRequest) -> Result<String> {
     String::from_utf8(body_data).context("Invalid UTF-8 in request body")
 }
 
-/// Downloads a file from a URL using WASI HTTP outgoing handler
 fn download_from_url(url: &str) -> Result<Vec<u8>> {
     log(
         Level::Info,
         "",
-        &format!("🌐 Downloading attachment from: {}", url),
+        &format!("Downloading attachment from: {}", url),
     );
 
-    // Parse the URL to extract components
     let parsed_url = parse_url(url)?;
 
-    // Create outgoing request
     let headers = Fields::new();
     let outgoing_request = OutgoingRequest::new(headers);
 
-    // Set the request method to GET
     outgoing_request
         .set_method(&Method::Get)
         .map_err(|_| anyhow::anyhow!("Failed to set method"))?;
 
-    // Set the scheme (http or https)
     outgoing_request
         .set_scheme(Some(&parsed_url.scheme))
         .map_err(|_| anyhow::anyhow!("Failed to set scheme"))?;
 
-    // Set the authority (host:port)
     outgoing_request
         .set_authority(Some(&parsed_url.authority))
         .map_err(|_| anyhow::anyhow!("Failed to set authority"))?;
 
-    // Set the path and query
     outgoing_request
         .set_path_with_query(Some(&parsed_url.path_and_query))
         .map_err(|_| anyhow::anyhow!("Failed to set path"))?;
@@ -310,14 +211,12 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
     log(
         Level::Info,
         "",
-        &format!("📤 Sending HTTP request to {}", url),
+        &format!("Sending HTTP request to {}", url),
     );
 
-    // Send the request
     let future_response = outgoing_handler::handle(outgoing_request, None)
         .map_err(|e| anyhow::anyhow!("Failed to send HTTP request: {e:?}"))?;
 
-    // Wait for the response
     let incoming_response = match future_response.get() {
         Some(result) => result.map_err(|e| anyhow::anyhow!("HTTP request failed: {e:?}"))?,
         None => {
@@ -330,7 +229,6 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
     }
     .map_err(|e| anyhow::anyhow!("HTTP response error: {e:?}"))?;
 
-    // Check status code
     let status = incoming_response.status();
     if status < 200 || status >= 300 {
         return Err(anyhow::anyhow!(
@@ -342,10 +240,9 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
     log(
         Level::Info,
         "",
-        &format!("✅ Received response with status: {}", status),
+        &format!("Received response with status: {}", status),
     );
 
-    // Read the response body
     let response_body = incoming_response
         .consume()
         .map_err(|_| anyhow::anyhow!("Failed to consume response"))?;
@@ -371,13 +268,12 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
     log(
         Level::Info,
         "",
-        &format!("📦 Downloaded {} bytes from URL", data.len()),
+        &format!("Downloaded {} bytes from URL", data.len()),
     );
 
     Ok(data)
 }
 
-/// Simple URL parser for extracting scheme, authority, and path
 struct ParsedUrl {
     scheme: Scheme,
     authority: String,
@@ -385,7 +281,6 @@ struct ParsedUrl {
 }
 
 fn parse_url(url: &str) -> Result<ParsedUrl> {
-    // Split scheme
     let (scheme_str, rest) = url
         .split_once("://")
         .ok_or_else(|| anyhow::anyhow!("Invalid URL: missing scheme"))?;
@@ -396,7 +291,6 @@ fn parse_url(url: &str) -> Result<ParsedUrl> {
         other => Scheme::Other(other.to_string()),
     };
 
-    // Split authority and path
     let (authority, path_and_query) = if let Some(idx) = rest.find('/') {
         let (auth, path) = rest.split_at(idx);
         (auth.to_string(), path.to_string())
@@ -411,11 +305,10 @@ fn parse_url(url: &str) -> Result<ParsedUrl> {
     })
 }
 
-/// Extracts filename from URL (last segment of path)
 fn extract_filename_from_url(url: &str) -> String {
     url.split('/')
         .last()
-        .and_then(|s| s.split('?').next()) // Remove query params
+        .and_then(|s| s.split('?').next())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "downloaded_attachment".to_string())
@@ -438,9 +331,7 @@ fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Messag
 
     let mut attachments: Option<Vec<Attachment>> = None;
 
-    // Handle URL Attachment(s) - Download from URL using WASI HTTP outgoing handler
     if let Some(attachments_val) = json.get("attachments") {
-        // Support array of attachment objects with url and optional content_type
         if let Some(attachments_array) = attachments_val.as_array() {
             let mut attachment_list = Vec::new();
 
@@ -453,21 +344,18 @@ fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Messag
                 log(
                     Level::Info,
                     "",
-                    &format!("🌐 Fetching attachment from URL: {}", url),
+                    &format!("Fetching attachment from URL: {}", url),
                 );
 
-                // Download the file from the URL
                 let content = download_from_url(url)
                     .with_context(|| format!("Failed to download attachment from URL: {}", url))?;
 
-                // Use provided filename or extract from URL
                 let filename = attachment_obj
                     .get("filename")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| extract_filename_from_url(url));
 
-                // Use provided content_type or default to octet-stream
                 let content_type = attachment_obj
                     .get("content_type")
                     .and_then(|v| v.as_str())
@@ -478,7 +366,7 @@ fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Messag
                     Level::Info,
                     "",
                     &format!(
-                        "📎 Downloaded {} bytes as '{}' ({})",
+                        "Downloaded {} bytes as '{}' ({})",
                         content.len(),
                         filename,
                         content_type
@@ -498,7 +386,6 @@ fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Messag
         }
     }
 
-    // Helper to parse email lists
     let parse_list = |key: &str| -> Option<Vec<String>> {
         json.get(key).and_then(|v| {
             let mut emails = Vec::new();
@@ -523,12 +410,12 @@ fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Messag
 
     Ok(Message {
         sender: Sender {
-            address: config.from.clone(),
+            from: config.from.clone(),
             reply_to: None,
             name: None,
         },
         recipient: Recipient {
-            to: config.to.clone(),
+            to: config.to.clone().into_vec(),
             cc: parse_list("cc"),
             bcc: parse_list("bcc"),
         },
