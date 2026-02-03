@@ -1,0 +1,6 @@
+package betty-blocks:auth-implementer;
+
+world hello {
+   import wasi:cli/environment@0.2.0;
+   export betty-blocks:auth/jwt;
+}

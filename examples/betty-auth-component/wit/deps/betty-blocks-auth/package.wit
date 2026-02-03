@@ -1,0 +1,33 @@
+package betty-blocks:auth;
+
+interface jwt {
+  record claims {
+    app-uuid: string,
+    aud: string,
+    auth-profile: string,
+    cas-token: string,
+    exp: u64,
+    iat: u64,
+    iss: string,
+    jti: string,
+    locale: option<string>,
+    nbf: u64,
+    roles: list<u32>,
+    user-id: u32,
+  }
+
+  variant auth-error {
+    missing-header,
+    invalid-format,
+    malformed-token,
+    unsupported-algorithm(string),
+    missing-config(string),
+    invalid-public-key(string),
+    validation-failed(string),
+  }
+
+  type auth-headers = list<tuple<string, string>>;
+
+  validate-token: func(headers: auth-headers) -> result<claims, auth-error>;
+}
+

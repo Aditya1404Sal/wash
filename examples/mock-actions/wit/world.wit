@@ -1,0 +1,5 @@
+package bettyblocks:mock-actions;
+
+world hello {
+   export betty-blocks:actions/actions;
+}

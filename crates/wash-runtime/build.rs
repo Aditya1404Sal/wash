@@ -66,8 +66,6 @@ fn build_fixtures_rust(workspace_dir: &Path) -> anyhow::Result<()> {
             continue;
         }
 
-        println!("cargo:warning=Building example: {}", name);
-
         // Build the example
         let status = Command::new("cargo")
             .args(["build", "--target", "wasm32-wasip2", "--release"])
@@ -101,7 +99,6 @@ fn build_fixtures_rust(workspace_dir: &Path) -> anyhow::Result<()> {
         }
     }
 
-    println!("cargo:warning=Finished building fixtures.");
     Ok(())
 }
 
@@ -124,7 +121,20 @@ fn check_and_rebuild_fixtures(workspace_dir: &Path) -> anyhow::Result<()> {
         for example in tracked_examples {
             let example_dir = examples_dir.join(example);
             if example_dir.exists() {
-                println!("cargo:rerun-if-changed={}", example_dir.display());
+                println!(
+                    "cargo:rerun-if-changed={}/Cargo.toml",
+                    example_dir.display()
+                );
+
+                let src_dir = example_dir.join("src");
+                if src_dir.exists() {
+                    println!("cargo:rerun-if-changed={}", src_dir.display());
+                }
+
+                let wit_dir = example_dir.join("wit");
+                if wit_dir.exists() {
+                    println!("cargo:rerun-if-changed={}", wit_dir.display());
+                }
             }
         }
     }
@@ -132,7 +142,6 @@ fn check_and_rebuild_fixtures(workspace_dir: &Path) -> anyhow::Result<()> {
     // Also rerun if fixtures themselves are missing/changed
     println!("cargo:rerun-if-changed={}", fixtures_dir.display());
 
-    println!("cargo:warning=Rebuilding test fixtures from examples...");
     build_fixtures_rust(workspace_dir)?;
 
     Ok(())

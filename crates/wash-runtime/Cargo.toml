@@ -73,6 +73,10 @@ oci-client = { workspace = true, optional = true, features = ["rustls-tls", "rus
 oci-wasm = { workspace = true, optional = true, features = ["rustls-tls"] }
 sha2 = { workspace = true, optional = true }
 wit-component = { workspace = true, optional = true }
+rand = "0.8"
+rsa = { version = "0.9", features = ["std"] }
+jsonwebtoken = "9.3"
+
 
 [build-dependencies]
 anyhow = { workspace = true, default-features = true }
