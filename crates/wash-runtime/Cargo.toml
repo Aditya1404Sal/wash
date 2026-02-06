@@ -21,6 +21,7 @@ wasi-blobstore = []
 wasi-keyvalue = []
 wasmcloud-smtp = ["dep:lettre", "dep:html2text"]
 wasi-webgpu = ["dep:wasi-webgpu-wasmtime", "dep:wasi-graphics-context-wasmtime"]
+tls = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -89,3 +90,5 @@ tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 gag = "1.0"
+mailin-embedded = { version = "0.8.3", features = ["ossl"] }
+parking_lot = "0.12"

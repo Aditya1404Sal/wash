@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
+use waki::Client;
 
 mod bindings {
     wit_bindgen::generate!({
@@ -12,10 +13,9 @@ use bindings::{
     bettyblocks::smtp::client::{Attachment, Credentials, Message, Recipient, Sender, SmtpClient, TlsMode},
     exports::wasi::http::incoming_handler::Guest,
     wasi::{
-        http::outgoing_handler,
         http::types::{
-            Fields, IncomingRequest, Method, OutgoingBody, OutgoingRequest, OutgoingResponse,
-            ResponseOutparam, Scheme,
+            Fields, IncomingRequest, OutgoingBody, OutgoingResponse,
+            ResponseOutparam,
         },
         io::streams::StreamError,
         logging::logging::{log, Level},
@@ -92,6 +92,7 @@ struct SmtpCredentials {
     port: u16,
     username: Option<String>,
     password: Option<String>,
+    tls_mode: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -119,10 +120,30 @@ fn default_port() -> u16 {
 }
 
 fn connect_smtp(config: &SmtpConfig) -> Result<SmtpClient> {
-    let (tls_mode, tls_mode_str) = match config.smtp.port {
-        465 => (TlsMode::Implicit, "Implicit (SSL)"),
-        25 => (TlsMode::None, "None (plaintext)"),
-        _ => (TlsMode::Starttls, "Explicit (STARTTLS)"),
+    let (tls_mode, tls_mode_str) = if let Some(ref mode_str) = config.smtp.tls_mode {
+        match mode_str.to_lowercase().as_str() {
+            "none" | "plaintext" => (TlsMode::None, "None (plaintext)"),
+            "starttls" | "explicit" => (TlsMode::Starttls, "Explicit (STARTTLS)"),
+            "implicit" | "ssl" | "tls" => (TlsMode::Implicit, "Implicit (SSL)"),
+            _ => {
+                log(
+                    Level::Warn,
+                    "",
+                    &format!("Unknown TLS mode '{}', falling back to port-based detection", mode_str),
+                );
+                match config.smtp.port {
+                    465 => (TlsMode::Implicit, "Implicit (SSL)"),
+                    25 => (TlsMode::None, "None (plaintext)"),
+                    _ => (TlsMode::Starttls, "Explicit (STARTTLS)"),
+                }
+            }
+        }
+    } else {
+        match config.smtp.port {
+            465 => (TlsMode::Implicit, "Implicit (SSL)"),
+            25 => (TlsMode::None, "None (plaintext)"),
+            _ => (TlsMode::Starttls, "Explicit (STARTTLS)"),
+        }
     };
 
     log(
@@ -187,49 +208,13 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
         &format!("Downloading attachment from: {}", url),
     );
 
-    let parsed_url = parse_url(url)?;
-
-    let headers = Fields::new();
-    let outgoing_request = OutgoingRequest::new(headers);
-
-    outgoing_request
-        .set_method(&Method::Get)
-        .map_err(|_| anyhow::anyhow!("Failed to set method"))?;
-
-    outgoing_request
-        .set_scheme(Some(&parsed_url.scheme))
-        .map_err(|_| anyhow::anyhow!("Failed to set scheme"))?;
-
-    outgoing_request
-        .set_authority(Some(&parsed_url.authority))
-        .map_err(|_| anyhow::anyhow!("Failed to set authority"))?;
-
-    outgoing_request
-        .set_path_with_query(Some(&parsed_url.path_and_query))
-        .map_err(|_| anyhow::anyhow!("Failed to set path"))?;
-
-    log(
-        Level::Info,
-        "",
-        &format!("Sending HTTP request to {}", url),
-    );
-
-    let future_response = outgoing_handler::handle(outgoing_request, None)
+    let client = Client::new();
+    let response = client
+        .get(url)
+        .send()
         .map_err(|e| anyhow::anyhow!("Failed to send HTTP request: {e:?}"))?;
 
-    let incoming_response = match future_response.get() {
-        Some(result) => result.map_err(|e| anyhow::anyhow!("HTTP request failed: {e:?}"))?,
-        None => {
-            future_response.subscribe().block();
-            future_response
-                .get()
-                .ok_or_else(|| anyhow::anyhow!("Failed to get response"))?
-                .map_err(|e| anyhow::anyhow!("HTTP request failed: {e:?}"))?
-        }
-    }
-    .map_err(|e| anyhow::anyhow!("HTTP response error: {e:?}"))?;
-
-    let status = incoming_response.status();
+    let status = response.status_code();
     if status < 200 || status >= 300 {
         return Err(anyhow::anyhow!(
             "HTTP request failed with status code: {}",
@@ -243,27 +228,9 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
         &format!("Received response with status: {}", status),
     );
 
-    let response_body = incoming_response
-        .consume()
-        .map_err(|_| anyhow::anyhow!("Failed to consume response"))?;
-
-    let input_stream = response_body
-        .stream()
-        .map_err(|_| anyhow::anyhow!("Failed to get response stream"))?;
-
-    let mut data = Vec::new();
-    loop {
-        match input_stream.blocking_read(8192) {
-            Ok(chunk) if chunk.is_empty() => break,
-            Ok(chunk) => data.extend_from_slice(&chunk),
-            Err(StreamError::Closed) => break,
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "Stream error while reading response: {e:?}"
-                ))
-            }
-        }
-    }
+    let data = response
+        .body()
+        .map_err(|e| anyhow::anyhow!("Failed to read response body: {e:?}"))?;
 
     log(
         Level::Info,
@@ -272,37 +239,6 @@ fn download_from_url(url: &str) -> Result<Vec<u8>> {
     );
 
     Ok(data)
-}
-
-struct ParsedUrl {
-    scheme: Scheme,
-    authority: String,
-    path_and_query: String,
-}
-
-fn parse_url(url: &str) -> Result<ParsedUrl> {
-    let (scheme_str, rest) = url
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL: missing scheme"))?;
-
-    let scheme = match scheme_str.to_lowercase().as_str() {
-        "http" => Scheme::Http,
-        "https" => Scheme::Https,
-        other => Scheme::Other(other.to_string()),
-    };
-
-    let (authority, path_and_query) = if let Some(idx) = rest.find('/') {
-        let (auth, path) = rest.split_at(idx);
-        (auth.to_string(), path.to_string())
-    } else {
-        (rest.to_string(), "/".to_string())
-    };
-
-    Ok(ParsedUrl {
-        scheme,
-        authority,
-        path_and_query,
-    })
 }
 
 fn extract_filename_from_url(url: &str) -> String {
@@ -412,7 +348,7 @@ fn build_email_message(body_content: &str, config: &SmtpConfig) -> Result<Messag
         sender: Sender {
             from: config.from.clone(),
             reply_to: None,
-            name: None,
+            display_name: None,
         },
         recipient: Recipient {
             to: config.to.clone().into_vec(),

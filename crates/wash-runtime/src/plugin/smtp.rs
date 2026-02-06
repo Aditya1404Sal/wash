@@ -222,7 +222,6 @@ impl HostPlugin for BettySmtp {
     }
 }
 
-// Resource host trait implementation for smtp-client
 impl HostSmtpClient for Ctx {
     async fn connect(
         &mut self,

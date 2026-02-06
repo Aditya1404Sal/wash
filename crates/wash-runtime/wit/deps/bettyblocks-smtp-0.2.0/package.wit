@@ -6,9 +6,6 @@ interface client {
         port: option<u16>,
         username: option<string>,
         password: option<string>,
-        /// - none: No TLS (plaintext, port 25).
-        /// - starttls: Explicit TLS via STARTTLS (port 587)
-        /// - implicit: Implicit TLS (port 465).
         tls-mode: tls-mode,
     }
 

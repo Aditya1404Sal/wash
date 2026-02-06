@@ -1,6 +1,6 @@
 # SMTP Email Component
 
-A WebAssembly component that sends emails via SMTP with support for attachments downloaded from URLs and automatic TLS configuration.
+A WebAssembly component that sends emails via SMTP with support for attachments downloaded from URLs, with non-tls & auto-tls support
 
 ## Features
 
