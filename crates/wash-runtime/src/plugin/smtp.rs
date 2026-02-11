@@ -2,14 +2,14 @@ use dashmap::DashMap;
 use html2text::from_read;
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
-    message::{Attachment, MultiPart, header::ContentType},
+    message::{Attachment, Mailbox, MultiPart, header::ContentType},
     transport::smtp::authentication::Credentials as LettreCredentials,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::{collections::HashSet, sync::Arc};
 
-use wasmtime::component::{HasSelf, Resource};
+use wasmtime::component::HasSelf;
 
 use crate::{
     engine::{ctx::Ctx, workload::WorkloadComponent},
@@ -18,13 +18,14 @@ use crate::{
 };
 
 use bindings::bettyblocks::smtp::client::{
-    Credentials, Host, HostSmtpClient, Message, SendResult, TlsMode, add_to_linker,
+    Credentials, Host, Message, SendResult, TlsMode, add_to_linker,
 };
 
 const BETTYBLOCKS_SMTP_PLUGIN_ID: &str = "bettyblocks-smtp";
 const PLAIN_TEXT_WIDTH: usize = 80;
 const MAX_POOLED_CONNECTIONS: u32 = 5;
 const MIN_IDLE_CONNECTIONS: u32 = 0;
+const TRANSPORT_TTL_SECS: u64 = 24 * 60 * 60; //24 hours
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -32,20 +33,15 @@ mod bindings {
         imports: {
             default: async | trappable
         },
-        with: {
-            "bettyblocks:smtp/client/smtp-client": crate::plugin::smtp::SmtpClientHandle,
-        },
     });
 }
-
-/// Wasmtime Resource handle that represents an SMTP client connection.(this is the connection_key)
-pub type SmtpClientHandle = String;
 
 #[derive(Clone)]
 pub struct SharedTransport {
     pub transport: Arc<AsyncSmtpTransport<Tokio1Executor>>,
     pub credentials: Credentials,
-    pub created_at: u64,
+    /// Epoch seconds when this transport was last used (for send)
+    pub last_used: u64,
     /// The connection key is the hash of host:port:username:password to identify unique connections
     pub connection_key: String,
 }
@@ -115,10 +111,28 @@ impl BettySmtp {
             .build())
     }
 
+    fn cleanup_stale_transports(&self) {
+        let now = Self::get_timestamp();
+        self.transport_pool.retain(|key, transport| {
+            let stale = now.saturating_sub(transport.last_used) > TRANSPORT_TTL_SECS;
+            if stale {
+                tracing::info!(
+                    connection_key = key,
+                    last_used_secs_ago = now.saturating_sub(transport.last_used),
+                    "Removing stale SMTP transport from pool"
+                );
+            }
+            !stale
+        });
+    }
+
     async fn get_or_create_transport(&self, credentials: &Credentials) -> anyhow::Result<String> {
+        self.cleanup_stale_transports();
+
         let connection_key = Self::generate_connection_key(credentials);
 
-        if self.transport_pool.contains_key(&connection_key) {
+        if let Some(mut entry) = self.transport_pool.get_mut(&connection_key) {
+            entry.last_used = Self::get_timestamp();
             tracing::debug!(
                 connection_key = connection_key,
                 host = credentials.host,
@@ -145,7 +159,7 @@ impl BettySmtp {
         let shared_transport = SharedTransport {
             transport: Arc::new(transport),
             credentials: credentials.clone(),
-            created_at: Self::get_timestamp(),
+            last_used: Self::get_timestamp(),
             connection_key: connection_key.clone(),
         };
 
@@ -211,22 +225,16 @@ impl HostPlugin for BettySmtp {
         workload_id: &str,
         _interfaces: HashSet<crate::wit::WitInterface>,
     ) -> anyhow::Result<()> {
-        // Note: We don't remove transports from the pool here
-        // They can be reused by other workloads with the same configuration
-        // Transports will be cleaned up when the plugin is dropped
-        // Use disconnect to explicitly remove the transports.
-
         tracing::debug!("BettySmtp plugin unbound from workload '{workload_id}'");
-
         Ok(())
     }
 }
 
-impl HostSmtpClient for Ctx {
+impl Host for Ctx {
     async fn connect(
         &mut self,
         credentials: Credentials,
-    ) -> anyhow::Result<Result<Resource<SmtpClientHandle>, String>> {
+    ) -> anyhow::Result<Result<String, String>> {
         let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) else {
             return Ok(Err("SMTP plugin not available".to_string()));
         };
@@ -246,44 +254,60 @@ impl HostSmtpClient for Ctx {
             "SMTP client connected (using shared transport)"
         );
 
-        let resource = self.table.push(connection_key)?;
-        Ok(Ok(resource))
+        Ok(Ok(connection_key))
     }
 
     async fn send(
         &mut self,
-        client: Resource<SmtpClientHandle>,
+        connection_key: String,
         message: Message,
     ) -> anyhow::Result<Result<SendResult, String>> {
-        let connection_key = self.table.get(&client)?;
-
         let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) else {
             return Ok(Err("SMTP plugin not available".to_string()));
         };
+        plugin.cleanup_stale_transports();
 
-        let Some(shared_transport) = plugin.transport_pool.get(connection_key) else {
-            return Ok(Err(format!(
-                "SMTP transport '{}' not found",
-                connection_key
-            )));
+        // Important(Aditya): We clone transport data and drop the DashMap guard before any .await
+        // to avoid holding a sync lock across async suspension points (deadlock).
+        let transport_data = {
+            let Some(mut shared_transport) = plugin.transport_pool.get_mut(&connection_key) else {
+                return Ok(Err(format!(
+                    "SMTP transport '{}' not found",
+                    connection_key
+                )));
+            };
+            shared_transport.last_used = BettySmtp::get_timestamp();
+            shared_transport.clone()
         };
 
+        let display_name = message
+            .sender
+            .display_name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+            .map(String::from);
+
+        let from_mailbox = Mailbox::new(
+            display_name.clone(),
+            message
+                .sender
+                .from
+                .parse()
+                .map_err(|e| anyhow::Error::msg(format!("invalid sender address: {e}")))?,
+        );
+
         let mut email_builder = lettre::Message::builder()
-            .from(
-                message
-                    .sender
-                    .from
-                    .parse()
-                    .map_err(|e| anyhow::Error::msg(format!("invalid sender address: {e}")))?,
-            )
+            .from(from_mailbox)
             .subject(message.subject.clone());
 
         if let Some(reply_to) = message.sender.reply_to {
-            email_builder = email_builder.reply_to(
+            let reply_to_mailbox = Mailbox::new(
+                display_name,
                 reply_to
                     .parse()
                     .map_err(|e| anyhow::Error::msg(format!("invalid reply-to address: {e}")))?,
             );
+            email_builder = email_builder.reply_to(reply_to_mailbox);
         }
 
         for to in message.recipient.to {
@@ -312,10 +336,10 @@ impl HostSmtpClient for Ctx {
 
         let plain_text = from_read(message.body.as_bytes(), PLAIN_TEXT_WIDTH).unwrap_or_else(|e| {
             tracing::warn!(
-                "Failed to convert HTML to plain text: {}, using empty string",
+                "Failed to convert HTML to plain text: {}, using raw body as fallback",
                 e
             );
-            String::new()
+            message.body.clone()
         });
 
         let mut multipart = MultiPart::mixed()
@@ -343,7 +367,7 @@ impl HostSmtpClient for Ctx {
             "Sending email via shared SMTP transport"
         );
 
-        match shared_transport.transport.send(email).await {
+        match transport_data.transport.send(email).await {
             Ok(response) => {
                 tracing::debug!(
                     workload_id = %self.workload_id,
@@ -358,8 +382,8 @@ impl HostSmtpClient for Ctx {
                     Some(raw_msg)
                 };
 
-                let effective_port = shared_transport.credentials.port.unwrap_or(
-                    match shared_transport.credentials.tls_mode {
+                let effective_port = transport_data.credentials.port.unwrap_or(
+                    match transport_data.credentials.tls_mode {
                         TlsMode::Implicit => 465,
                         TlsMode::Starttls => 587,
                         TlsMode::None => 25,
@@ -368,7 +392,7 @@ impl HostSmtpClient for Ctx {
 
                 let server_addr = Some(format!(
                     "{}:{}",
-                    shared_transport.credentials.host, effective_port
+                    transport_data.credentials.host, effective_port
                 ));
 
                 Ok(Ok(SendResult {
@@ -388,22 +412,16 @@ impl HostSmtpClient for Ctx {
         }
     }
 
-    // Removes the transport from the pool to force disconnect
-    async fn disconnect(
-        &mut self,
-        client: Resource<SmtpClientHandle>,
-    ) -> anyhow::Result<Result<(), String>> {
-        let connection_key = self.table.get(&client)?;
-
+    async fn disconnect(&mut self, connection_key: String) -> anyhow::Result<Result<(), String>> {
         let Some(plugin) = self.get_plugin::<BettySmtp>(BETTYBLOCKS_SMTP_PLUGIN_ID) else {
             return Ok(Err("SMTP plugin not available".to_string()));
         };
 
-        if plugin.transport_pool.remove(connection_key).is_some() {
+        if plugin.transport_pool.remove(&connection_key).is_some() {
             tracing::debug!(
                 workload_id = self.workload_id.to_string(),
                 connection_key = connection_key,
-                "SMTP transport forcefully disconnected and removed from pool"
+                "SMTP transport disconnected and removed from pool"
             );
             Ok(Ok(()))
         } else {
@@ -415,37 +433,11 @@ impl HostSmtpClient for Ctx {
             Ok(Ok(()))
         }
     }
-
-    async fn drop(&mut self, rep: Resource<SmtpClientHandle>) -> anyhow::Result<()> {
-        let connection_key = self.table.get(&rep)?;
-
-        tracing::debug!(
-            workload_id = self.workload_id.to_string(),
-            connection_key = connection_key,
-            "Dropping SMTP client resource (transport remains in pool for reuse)"
-        );
-
-        // Note: we intentionally do NOT remove the transport from the pool here.
-        // this allows connection pooling where subsequent requests with the same
-        // credentials will reuse the existing transport.
-        // Use disconnect() to explicitly close and remove the connection.
-
-        self.table.delete(rep)?;
-        Ok(())
-    }
 }
-
-impl Host for Ctx {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_smtp_plugin_creation() {
-        let smtp = BettySmtp::new();
-        assert_eq!(smtp.transport_pool.len(), 0);
-    }
 
     #[test]
     fn test_connection_key_consistency() {
@@ -471,6 +463,89 @@ mod tests {
         assert_eq!(
             key1, key2,
             "Same credentials should produce same connection key"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stale_transport_cleanup() {
+        let smtp = BettySmtp::new();
+
+        let old_transport = SharedTransport {
+            transport: Arc::new(
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("localhost").build(),
+            ),
+            credentials: Credentials {
+                host: "localhost".to_string(),
+                port: None,
+                username: None,
+                password: None,
+                tls_mode: TlsMode::None,
+            },
+            last_used: 0, // 0 epoch = very old
+            connection_key: "conn-old".to_string(),
+        };
+        smtp.transport_pool
+            .insert("conn-old".to_string(), old_transport);
+
+        let fresh_transport = SharedTransport {
+            transport: Arc::new(
+                AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("localhost").build(),
+            ),
+            credentials: Credentials {
+                host: "localhost".to_string(),
+                port: None,
+                username: None,
+                password: None,
+                tls_mode: TlsMode::None,
+            },
+            last_used: BettySmtp::get_timestamp(),
+            connection_key: "conn-fresh".to_string(),
+        };
+        smtp.transport_pool
+            .insert("conn-fresh".to_string(), fresh_transport);
+
+        assert_eq!(smtp.transport_pool.len(), 2);
+
+        smtp.cleanup_stale_transports();
+
+        assert_eq!(smtp.transport_pool.len(), 1);
+        assert!(smtp.transport_pool.contains_key("conn-fresh"));
+        assert!(!smtp.transport_pool.contains_key("conn-old"));
+    }
+
+    #[tokio::test]
+    async fn test_connection_reuse_same_credentials() {
+        let smtp = BettySmtp::new();
+
+        let creds = Credentials {
+            host: "localhost".to_string(),
+            port: Some(2525),
+            username: None,
+            password: None,
+            tls_mode: TlsMode::None,
+        };
+
+        let key = BettySmtp::generate_connection_key(&creds);
+        let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("localhost")
+            .port(2525)
+            .build();
+        smtp.transport_pool.insert(
+            key.clone(),
+            SharedTransport {
+                transport: Arc::new(transport),
+                credentials: creds.clone(),
+                last_used: BettySmtp::get_timestamp(),
+                connection_key: key.clone(),
+            },
+        );
+
+        let result = smtp.get_or_create_transport(&creds).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), key);
+        assert_eq!(
+            smtp.transport_pool.len(),
+            1,
+            "pool should still have exactly 1 entry (reused, not duplicated)"
         );
     }
 }

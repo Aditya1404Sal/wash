@@ -1,12 +1,9 @@
-//! Integration test for smtp-demo component with concurrent support and URL attachments
-
 use anyhow::{Context, Result};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use testcontainers::{GenericImage, core::IntoContainerPort, core::WaitFor, runners::AsyncRunner};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
-
-use mailin_embedded::{Handler, Server, response::OK};
-use parking_lot::Mutex;
-use std::io;
 
 mod common;
 use common::find_available_port;
@@ -21,767 +18,11 @@ use wash_runtime::{
     types::{Component, LocalResources, Workload, WorkloadStartRequest},
     wit::WitInterface,
 };
+
 const SMTP_DEMO_WASM: &[u8] = include_bytes!("fixtures/smtp_demo.wasm");
+const SMTP4DEV_SMTP_PORT: u16 = 25;
+const SMTP4DEV_API_PORT: u16 = 80;
 
-// Leaving empty for now : use for tls based tests
-#[allow(unused)]
-const SMTP_USERNAME: &str = "";
-#[allow(unused)]
-const SMTP_PASSWORD: &str = "";
-#[allow(unused)]
-const FROM_EMAIL: &str = "";
-#[allow(unused)]
-const TO_EMAIL: &str = "";
-
-#[cfg(feature = "tls")]
-#[tokio::test]
-async fn test_smtp_demo_integration() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
-    println!("Starting SMTP demo component integration test");
-
-    let engine = Engine::builder().build()?;
-    let port = find_available_port().await?;
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let http_handler = DevRouter::default();
-    let http_plugin = HttpServer::new(http_handler, addr);
-    let smtp_plugin = BettySmtp::new();
-    let logging_plugin = WasiLogging {};
-    let config_plugin = WasiConfig::default();
-
-    let host = HostBuilder::new()
-        .with_engine(engine.clone())
-        .with_http_handler(Arc::new(http_plugin))
-        .with_plugin(Arc::new(smtp_plugin))?
-        .with_plugin(Arc::new(logging_plugin))?
-        .with_plugin(Arc::new(config_plugin))?
-        .build()?;
-
-    println!("Created host with HTTP, SMTP, and logging plugins");
-
-    let host = host.start().await.context("Failed to start host")?;
-    println!("Host started, HTTP server listening on {addr}");
-
-    let req = WorkloadStartRequest {
-        workload_id: uuid::Uuid::new_v4().to_string(),
-        workload: Workload {
-            namespace: "test".to_string(),
-            name: "smtp-demo-workload".to_string(),
-            annotations: HashMap::new(),
-            service: None,
-            components: vec![Component {
-                bytes: bytes::Bytes::from_static(SMTP_DEMO_WASM),
-                local_resources: LocalResources {
-                    memory_limit_mb: 256,
-                    cpu_limit: 1,
-                    config: {
-                        let config = HashMap::new();
-                        config
-                    },
-                    environment: HashMap::new(),
-                    volume_mounts: vec![],
-                    allowed_hosts: vec![],
-                },
-                pool_size: 1,
-                max_invocations: 100,
-            }],
-            host_interfaces: vec![
-                WitInterface {
-                    namespace: "wasi".to_string(),
-                    package: "http".to_string(),
-                    interfaces: ["incoming-handler".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.2").unwrap()),
-                    config: {
-                        let mut config = HashMap::new();
-                        config.insert("host".to_string(), "smtp-test".to_string());
-                        config
-                    },
-                },
-                WitInterface {
-                    namespace: "wasi".to_string(),
-                    package: "http".to_string(),
-                    interfaces: ["outgoing-handler".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.2").unwrap()),
-                    config: HashMap::new(),
-                },
-                WitInterface {
-                    namespace: "bettyblocks".to_string(),
-                    package: "smtp".to_string(),
-                    interfaces: ["client".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.0").unwrap()),
-                    config: HashMap::new(),
-                },
-                WitInterface {
-                    namespace: "wasi".to_string(),
-                    package: "logging".to_string(),
-                    interfaces: ["logging".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.1.0-draft").unwrap()),
-                    config: HashMap::new(),
-                },
-                WitInterface {
-                    namespace: "wasi".to_string(),
-                    package: "config".to_string(),
-                    interfaces: ["store".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.0-rc.1").unwrap()),
-                    config: HashMap::new(),
-                },
-            ],
-            volumes: vec![],
-        },
-    };
-
-    let workload_response = host
-        .workload_start(req)
-        .await
-        .context("Failed to start smtp-demo workload")?;
-
-    println!("\n╔═══════════════════════════════════════════════════════════════════════╗");
-    println!("║                         📧 WORKLOAD DEPLOYED                          ║");
-    println!("╠═══════════════════════════════════════════════════════════════════════╣");
-    println!(
-        "║ Workload ID: {:51} ║",
-        workload_response.workload_status.workload_id
-    );
-    println!("║ Connection:  Persistent (connection pooling enabled)                 ║");
-    println!("╚═══════════════════════════════════════════════════════════════════════╝");
-
-    let client = reqwest::Client::new();
-
-    // Test 1: Send a simple email
-    println!("Test 1: Sending email with simple text body");
-
-    let simple_payload = serde_json::json!({
-        "smtp": {
-            "host": "smtp.gmail.com",
-            "port": 465,
-            "username": SMTP_USERNAME,
-            "password": SMTP_PASSWORD
-        },
-        "from": FROM_EMAIL,
-        "to": [TO_EMAIL],
-        "subject": "Test Email - Simple Text",
-        "body": "Hello, this is a test email from the SMTP component integration test!"
-    });
-
-    let first_response = timeout(
-        Duration::from_secs(30),
-        client
-            .post(format!("http://{addr}/"))
-            .header("HOST", "smtp-test")
-            .header("Content-Type", "application/json")
-            .json(&simple_payload)
-            .send(),
-    )
-    .await
-    .context("First email request timed out")?
-    .context("Failed to make first email request")?;
-
-    let first_status = first_response.status();
-    println!("First Email Response Status: {}", first_status);
-
-    let first_response_text = first_response
-        .text()
-        .await
-        .context("Failed to read first response body")?;
-    println!("First Email Response: {}", first_response_text.trim());
-
-    // Test 2: Send email with HTML content
-    println!("Test 2: Sending email with HTML content");
-
-    let html_payload = serde_json::json!({
-        "smtp": {
-            "host": "smtp.gmail.com",
-            "port": 465,
-            "username": SMTP_USERNAME,
-            "password": SMTP_PASSWORD
-        },
-        "from": FROM_EMAIL,
-        "to": [TO_EMAIL],
-        "subject": "Test Email - HTML Content",
-        "body": r#"
-            <html>
-                <body>
-                    <h1>Test Email</h1>
-                    <p>This is a <strong>test email</strong> with HTML content.</p>
-                </body>
-            </html>
-        "#
-    });
-
-    let second_response = timeout(
-        Duration::from_secs(30),
-        client
-            .post(format!("http://{addr}/"))
-            .header("HOST", "smtp-test")
-            .header("Content-Type", "application/json")
-            .json(&html_payload)
-            .send(),
-    )
-    .await
-    .context("Second email request timed out")?
-    .context("Failed to make second email request")?;
-
-    let second_status = second_response.status();
-    println!("Second Email Response Status: {}", second_status);
-
-    // Test 3: Multiple rapid concurrent email requests
-    println!("Test 3: Sending multiple concurrent email requests");
-    let mut handles = Vec::new();
-
-    for i in 0..3 {
-        let client = client.clone();
-        let addr = addr;
-
-        let concurrent_payload = serde_json::json!({
-            "smtp": {
-                "host": "smtp.gmail.com",
-                "port": 465,
-                "username": SMTP_USERNAME,
-                "password": SMTP_PASSWORD
-            },
-            "from": FROM_EMAIL,
-            "to": [TO_EMAIL],
-            "subject": format!("Test Email - Concurrent #{}", i + 1),
-            "body": format!("Test email #{} from concurrent request", i + 1)
-        });
-
-        let handle = tokio::spawn(async move {
-            let response = client
-                .post(format!("http://{addr}/"))
-                .header("HOST", "smtp-test")
-                .header("Content-Type", "application/json")
-                .json(&concurrent_payload)
-                .send()
-                .await;
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    println!(
-                        "Concurrent email {} - Status: {}, Response: {}",
-                        i + 1,
-                        status,
-                        text.trim()
-                    );
-                    (status.as_u16(), text)
-                }
-                Err(e) => {
-                    println!("Concurrent email {} request failed: {}", i + 1, e);
-                    (0, String::new())
-                }
-            }
-        });
-        handles.push(handle);
-    }
-
-    // Wait for all concurrent requests to complete
-    let mut completed_requests = 0;
-    let mut success_count = 0;
-    for handle in handles {
-        if let Ok((status, _text)) = handle.await {
-            if status >= 200 && status < 600 {
-                completed_requests += 1;
-                if status >= 200 && status < 300 {
-                    success_count += 1;
-                }
-            }
-        }
-    }
-
-    println!(
-        "Concurrent requests: {}/3 completed, {}/3 successful",
-        completed_requests, success_count
-    );
-
-    assert!(
-        completed_requests >= 2,
-        "At least 2 out of 3 concurrent requests should complete"
-    );
-
-    println!("\n┌─────────────────────────────────────────────────────────────────────┐");
-    println!("│                    SMTP Demo Integration Test Results                │");
-    println!("├─────────────────────────────────────────────────────────────────────┤");
-    println!("│ Test Step                                    │ Result    │ Status    │");
-    println!("├──────────────────────────────────────────────┼───────────┼───────────┤");
-    println!("│ Simple text email request                    │ ✓ PASS    │ Handled   │");
-    println!("│ HTML email request                           │ ✓ PASS    │ Handled   │");
-    println!(
-        "│ Concurrent requests (3 simultaneous)         │ ✓ PASS    │ {}/3       │",
-        completed_requests
-    );
-    println!("├──────────────────────────────────────────────┼───────────┼───────────┤");
-    println!("│ Connection Management                        │           │           │");
-    println!("│  • Persistent connection pooling             │ ✓ PASS    │ Active    │");
-    println!("│  • Concurrent request handling               │ ✓ PASS    │ Safe      │");
-    println!("│  • Connection reuse across requests          │ ✓ PASS    │ Working   │");
-    println!("└──────────────────────────────────────────────┴───────────┴───────────┘");
-    println!("\n🎉 SMTP Demo Component Integration: ALL TESTS PASSED");
-
-    Ok(())
-}
-
-#[cfg(feature = "tls")]
-#[tokio::test]
-async fn test_smtp_attachments_url() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init()
-        .ok();
-
-    println!("Starting SMTP attachment test (URL-based)");
-
-    let engine = Engine::builder().build()?;
-    let port = find_available_port().await?;
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let http_handler = DevRouter::default();
-    let http_plugin = HttpServer::new(http_handler, addr);
-    let smtp_plugin = BettySmtp::new();
-    let logging_plugin = WasiLogging {};
-    let config_plugin = WasiConfig::default();
-
-    let host = HostBuilder::new()
-        .with_engine(engine.clone())
-        .with_http_handler(Arc::new(http_plugin))
-        .with_plugin(Arc::new(smtp_plugin))?
-        .with_plugin(Arc::new(logging_plugin))?
-        .with_plugin(Arc::new(config_plugin))?
-        .build()?;
-
-    let host = host.start().await.context("Failed to start host")?;
-    println!("Host started on {addr}");
-
-    let req = WorkloadStartRequest {
-        workload_id: uuid::Uuid::new_v4().to_string(),
-        workload: Workload {
-            namespace: "test".to_string(),
-            name: "smtp-attachment-test".to_string(),
-            annotations: HashMap::new(),
-            service: None,
-            components: vec![Component {
-                bytes: bytes::Bytes::from_static(SMTP_DEMO_WASM),
-                local_resources: LocalResources {
-                    memory_limit_mb: 256,
-                    cpu_limit: 1,
-                    config: HashMap::new(),
-                    environment: HashMap::new(),
-                    volume_mounts: vec![],
-                    allowed_hosts: vec![],
-                },
-                pool_size: 1,
-                max_invocations: 100,
-            }],
-            host_interfaces: vec![
-                WitInterface {
-                    namespace: "wasi".to_string(),
-                    package: "http".to_string(),
-                    interfaces: ["incoming-handler".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.2").unwrap()),
-                    config: {
-                        let mut config = HashMap::new();
-                        config.insert("host".to_string(), "smtp-test".to_string());
-                        config
-                    },
-                },
-                WitInterface {
-                    namespace: "wasi".to_string(),
-                    package: "http".to_string(),
-                    interfaces: ["outgoing-handler".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.2").unwrap()),
-                    config: HashMap::new(),
-                },
-                WitInterface {
-                    namespace: "bettyblocks".to_string(),
-                    package: "smtp".to_string(),
-                    interfaces: ["client".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.0").unwrap()),
-                    config: HashMap::new(),
-                },
-                WitInterface {
-                    namespace: "wasi".to_string(),
-                    package: "logging".to_string(),
-                    interfaces: ["logging".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.1.0-draft").unwrap()),
-                    config: HashMap::new(),
-                },
-                WitInterface {
-                    namespace: "wasi".to_string(),
-                    package: "config".to_string(),
-                    interfaces: ["store".to_string()].into_iter().collect(),
-                    version: Some(semver::Version::parse("0.2.0-rc.1").unwrap()),
-                    config: HashMap::new(),
-                },
-            ],
-            volumes: vec![],
-        },
-    };
-
-    let workload_response = host
-        .workload_start(req)
-        .await
-        .context("Failed to start smtp workload")?;
-
-    println!(
-        "Workload ID: {}",
-        workload_response.workload_status.workload_id
-    );
-
-    let client = reqwest::Client::new();
-
-    // SMTP credentials - REPLACE WITH YOUR ACTUAL CREDENTIALS
-
-    // Test 1: Send email with URL-based attachment (PDF)
-    println!("\n=== Test 1: URL-based Attachment (PDF) ===");
-    let pdf_payload = serde_json::json!({
-        "smtp": {
-            "host": "smtp.gmail.com",
-            "port": 465,
-            "username": SMTP_USERNAME,
-            "password": SMTP_PASSWORD
-        },
-        "from": FROM_EMAIL,
-        "to": [TO_EMAIL],
-        "subject": "Test Email - PDF Attachment from URL",
-        "body": "<h1>PDF Attachment Test</h1><p>This email contains a PDF attachment downloaded from a URL.</p>",
-        "attachments": [{
-            "url": "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
-            "filename": "sample-document.pdf",
-            "content_type": "application/pdf"
-        }]
-    });
-
-    let pdf_response = timeout(
-        Duration::from_secs(45),
-        client
-            .post(format!("http://{addr}/"))
-            .header("HOST", "smtp-test")
-            .header("Content-Type", "application/json")
-            .json(&pdf_payload)
-            .send(),
-    )
-    .await
-    .context("PDF attachment request timed out")?
-    .context("Failed to send PDF attachment request")?;
-
-    let pdf_status = pdf_response.status();
-    let pdf_text = pdf_response.text().await.unwrap_or_default();
-    println!("PDF Attachment - Status: {}", pdf_status);
-    println!("Response: {}", pdf_text.trim());
-
-    // Test 2: Send email with URL-based attachment (MP4 Video)
-    println!("\n=== Test 2: URL-based Attachment (MP4 Video) ===");
-    let video_payload = serde_json::json!({
-        "smtp": {
-            "host": "smtp.gmail.com",
-            "port": 465,
-            "username": SMTP_USERNAME,
-            "password": SMTP_PASSWORD
-        },
-        "from": FROM_EMAIL,
-        "to": [TO_EMAIL],
-        "subject": "Test Email - Video Attachment from URL",
-        "body": "<h1>Video Attachment Test</h1><p>This email contains a short MP4 video downloaded from a URL.</p>",
-        "attachments": [{
-            "url": "https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_1MB.mp4",
-            "filename": "sample-video.mp4",
-            "content_type": "video/mp4"
-        }]
-    });
-
-    let video_response = timeout(
-        Duration::from_secs(60), // Longer timeout for video
-        client
-            .post(format!("http://{addr}/"))
-            .header("HOST", "smtp-test")
-            .header("Content-Type", "application/json")
-            .json(&video_payload)
-            .send(),
-    )
-    .await
-    .context("Video attachment request timed out")?
-    .context("Failed to send video attachment request")?;
-
-    let video_status = video_response.status();
-    let video_text = video_response.text().await.unwrap_or_default();
-    println!("Video Attachment - Status: {}", video_status);
-    println!("Response: {}", video_text.trim());
-
-    // Test 3: Send simple email without attachment
-    println!("\n=== Test 3: Simple Email (No Attachment) ===");
-    let simple_payload = serde_json::json!({
-        "smtp": {
-            "host": "smtp.gmail.com",
-            "port": 465,
-            "username": SMTP_USERNAME,
-            "password": SMTP_PASSWORD
-        },
-        "from": FROM_EMAIL,
-        "to": [TO_EMAIL],
-        "subject": "Test Email - Simple Text",
-        "body": "This is a simple test email without any attachments."
-    });
-
-    let simple_response = timeout(
-        Duration::from_secs(30),
-        client
-            .post(format!("http://{addr}/"))
-            .header("HOST", "smtp-test")
-            .header("Content-Type", "application/json")
-            .json(&simple_payload)
-            .send(),
-    )
-    .await
-    .context("Simple email request timed out")?
-    .context("Failed to send simple email request")?;
-
-    let simple_status = simple_response.status();
-    let simple_text = simple_response.text().await.unwrap_or_default();
-    println!("Simple Email - Status: {}", simple_status);
-    println!("Response: {}", simple_text.trim());
-
-    // Test 4: Email with multiple attachments (PNG + JSON)
-    println!("\n=== Test 4: Multiple URL Attachments ===");
-    let multiple_payload = serde_json::json!({
-        "smtp": {
-            "host": "smtp.gmail.com",
-            "port": 465,
-            "username": SMTP_USERNAME,
-            "password": SMTP_PASSWORD
-        },
-        "from": FROM_EMAIL,
-        "to": [TO_EMAIL],
-        "subject": "Test Email - Multiple Attachments",
-        "body": "<h1>Multiple Attachments Test</h1><p>This email contains multiple files from different URLs.</p>",
-        "attachments": [
-            {
-                "url": "https://httpbin.org/image/png",
-                "filename": "test-image.png",
-                "content_type": "image/png"
-            },
-            {
-                "url": "https://httpbin.org/json",
-                "filename": "test-data.json",
-                "content_type": "application/json"
-            }
-        ]
-    });
-
-    let multiple_response = timeout(
-        Duration::from_secs(45),
-        client
-            .post(format!("http://{addr}/"))
-            .header("HOST", "smtp-test")
-            .header("Content-Type", "application/json")
-            .json(&multiple_payload)
-            .send(),
-    )
-    .await
-    .context("Multiple attachments request timed out")?
-    .context("Failed to send multiple attachments request")?;
-
-    let multiple_status = multiple_response.status();
-    let multiple_text = multiple_response.text().await.unwrap_or_default();
-    println!("Multiple Attachments - Status: {}", multiple_status);
-    println!("Response: {}", multiple_text.trim());
-
-    // Test 5: Email with CC and BCC
-    println!("\n=== Test 5: Email with CC and BCC ===");
-    let cc_bcc_payload = serde_json::json!({
-        "smtp": {
-            "host": "smtp.gmail.com",
-            "port": 465,
-            "username": SMTP_USERNAME,
-            "password": SMTP_PASSWORD
-        },
-        "from": FROM_EMAIL,
-        "to": [TO_EMAIL],
-        "cc": ["aditya.salunkhe@bettyblocks.com"],
-        "bcc": ["theacademicfoodie@gmail.com"],
-        "subject": "Test Email - CC and BCC",
-        "body": "This email includes CC and BCC recipients."
-    });
-
-    let cc_bcc_response = timeout(
-        Duration::from_secs(30),
-        client
-            .post(format!("http://{addr}/"))
-            .header("HOST", "smtp-test")
-            .header("Content-Type", "application/json")
-            .json(&cc_bcc_payload)
-            .send(),
-    )
-    .await
-    .context("CC/BCC email request timed out")?
-    .context("Failed to send CC/BCC email request")?;
-
-    let cc_bcc_status = cc_bcc_response.status();
-    let cc_bcc_text = cc_bcc_response.text().await.unwrap_or_default();
-    println!("CC/BCC Email - Status: {}", cc_bcc_status);
-    println!("Response: {}", cc_bcc_text.trim());
-
-    // Results summary
-    println!("\n┌──────────────────────────────────────────────────────────────────┐");
-    println!("│          SMTP Attachment Test Results                           │");
-    println!("├──────────────────────────────────────────────────────────────────┤");
-    println!("│ Test Case                        │ Status    │ Result          │");
-    println!("├──────────────────────────────────┼───────────┼─────────────────┤");
-    let pdf_pass = pdf_status.is_success();
-    let video_pass = video_status.is_success();
-    let simple_pass = simple_status.is_success();
-    let multiple_pass = multiple_status.is_success();
-    let cc_bcc_pass = cc_bcc_status.is_success();
-
-    println!(
-        "│ PDF attachment from URL          │ {:3}       │ {}           │",
-        pdf_status.as_u16(),
-        if pdf_pass { "✓ PASS" } else { "✗ FAIL" }
-    );
-    println!(
-        "│ MP4 video attachment from URL    │ {:3}       │ {}           │",
-        video_status.as_u16(),
-        if video_pass { "✓ PASS" } else { "✗ FAIL" }
-    );
-    println!(
-        "│ Simple email (no attachment)     │ {:3}       │ {}           │",
-        simple_status.as_u16(),
-        if simple_pass { "✓ PASS" } else { "✗ FAIL" }
-    );
-    println!(
-        "│ Multiple attachments (PNG+JSON)  │ {:3}       │ {}           │",
-        multiple_status.as_u16(),
-        if multiple_pass {
-            "✓ PASS"
-        } else {
-            "✗ FAIL"
-        }
-    );
-    println!(
-        "│ Email with CC and BCC            │ {:3}       │ {}           │",
-        cc_bcc_status.as_u16(),
-        if cc_bcc_pass { "✓ PASS" } else { "✗ FAIL" }
-    );
-    println!("└──────────────────────────────────┴───────────┴─────────────────┘");
-
-    assert!(simple_pass, "Simple email should succeed");
-
-    Ok(())
-}
-
-// ============================================================================
-// LOCAL SMTP SERVER TESTS (Non-TLS)
-// ============================================================================
-
-/// Represents a captured email with all its components
-#[derive(Debug, Clone, Default)]
-struct CapturedEmail {
-    from: String,
-    to: Vec<String>,
-    data: Vec<u8>,
-}
-
-/// Handler for the mock SMTP server that captures all received emails.
-/// Uses a thread-local current_email pattern: `mail()` resets state via the
-/// shared `current_email`, and `data_end()` moves it into the `emails` vec.
-/// This is safe because `mailin_embedded` serializes connections on one thread.
-#[derive(Clone)]
-struct MockSmtpHandler {
-    emails: Arc<Mutex<Vec<CapturedEmail>>>,
-    current_email: Arc<Mutex<CapturedEmail>>,
-}
-
-impl MockSmtpHandler {
-    fn new() -> Self {
-        Self {
-            emails: Arc::new(Mutex::new(Vec::new())),
-            current_email: Arc::new(Mutex::new(CapturedEmail::default())),
-        }
-    }
-}
-
-impl Handler for MockSmtpHandler {
-    fn helo(&mut self, _ip: std::net::IpAddr, _domain: &str) -> mailin_embedded::Response {
-        OK
-    }
-
-    fn mail(
-        &mut self,
-        _ip: std::net::IpAddr,
-        _domain: &str,
-        from: &str,
-    ) -> mailin_embedded::Response {
-        let mut current = self.current_email.lock();
-        *current = CapturedEmail::default();
-        current.from = from.to_string();
-        OK
-    }
-
-    fn rcpt(&mut self, to: &str) -> mailin_embedded::Response {
-        let mut current = self.current_email.lock();
-        current.to.push(to.to_string());
-        OK
-    }
-
-    fn data_start(
-        &mut self,
-        _domain: &str,
-        _from: &str,
-        _is8bit: bool,
-        _to: &[String],
-    ) -> mailin_embedded::Response {
-        OK
-    }
-
-    fn data(&mut self, buf: &[u8]) -> io::Result<()> {
-        let mut current = self.current_email.lock();
-        current.data.extend_from_slice(buf);
-        Ok(())
-    }
-
-    fn data_end(&mut self) -> mailin_embedded::Response {
-        let current = self.current_email.lock().clone();
-        self.emails.lock().push(current);
-        OK
-    }
-
-    fn auth_plain(
-        &mut self,
-        _authorization_id: &str,
-        _authentication_id: &str,
-        _password: &str,
-    ) -> mailin_embedded::Response {
-        OK
-    }
-}
-
-/// Starts a local SMTP server on the given port and returns its thread handle.
-fn start_local_smtp_server(port: u16, handler: MockSmtpHandler) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut server = Server::new(handler);
-        server
-            .with_name("localhost")
-            .with_addr(format!("127.0.0.1:{port}"))
-            .expect("Failed to set SMTP server address");
-
-        if let Err(e) = server.serve() {
-            eprintln!("SMTP server error: {e}");
-        }
-    })
-}
-
-/// Poll-connect to an address until the server is ready or timeout expires.
-async fn wait_for_server(addr: &str) -> Result<()> {
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    anyhow::bail!("SMTP server at {addr} did not become ready in time")
-}
-
-/// Helper: create the standard workload request
 fn create_workload_request(name: &str, host_header: &str) -> WorkloadStartRequest {
     WorkloadStartRequest {
         workload_id: uuid::Uuid::new_v4().to_string(),
@@ -849,7 +90,6 @@ fn create_workload_request(name: &str, host_header: &str) -> WorkloadStartReques
     }
 }
 
-/// Helper: spin up Engine + Host + workload, return (http_addr, host).
 async fn setup_test_host(
     host_header: &str,
     workload_name: &str,
@@ -878,7 +118,6 @@ async fn setup_test_host(
     Ok((http_addr, host))
 }
 
-/// Helper: send a JSON email payload and return (status, body text).
 async fn send_email(
     client: &reqwest::Client,
     http_addr: SocketAddr,
@@ -904,8 +143,8 @@ async fn send_email(
     Ok((status, text))
 }
 
-/// Helper: build the common SMTP JSON payload for local non-TLS tests.
-fn local_smtp_payload(
+fn smtp_payload(
+    smtp_host: &str,
     smtp_port: u16,
     from: &str,
     to: &[&str],
@@ -913,7 +152,7 @@ fn local_smtp_payload(
     body: &str,
 ) -> serde_json::Value {
     serde_json::json!({
-        "smtp": { "host": "127.0.0.1", "port": smtp_port, "tls_mode": "none" },
+        "smtp": { "host": smtp_host, "port": smtp_port, "tls_mode": "none" },
         "from": from,
         "to": to,
         "subject": subject,
@@ -921,302 +160,581 @@ fn local_smtp_payload(
     })
 }
 
-/// Helper: start local SMTP + wait for readiness, returns (emails_ref, smtp_port, _thread).
-async fn start_mock_smtp() -> Result<(
-    Arc<Mutex<Vec<CapturedEmail>>>,
-    u16,
-    std::thread::JoinHandle<()>,
-)> {
-    let smtp_port = find_available_port().await?;
-    let handler = MockSmtpHandler::new();
-    let emails_ref = handler.emails.clone();
-    let thread = start_local_smtp_server(smtp_port, handler);
-    wait_for_server(&format!("127.0.0.1:{smtp_port}")).await?;
-    Ok((emails_ref, smtp_port, thread))
+struct SmtpServer {
+    smtp_host: String,
+    smtp_port: u16,
+    api_port: u16,
+    _container: testcontainers::ContainerAsync<GenericImage>,
 }
 
-// ---------------------------------------------------------------------------
+async fn start_smtp4dev() -> Result<SmtpServer> {
+    let container = GenericImage::new("rnwood/smtp4dev", "latest")
+        .with_exposed_port(SMTP4DEV_SMTP_PORT.tcp())
+        .with_exposed_port(SMTP4DEV_API_PORT.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Now listening on"))
+        .start()
+        .await
+        .context("failed to start smtp4dev container")?;
+
+    let smtp_port = container
+        .get_host_port_ipv4(SMTP4DEV_SMTP_PORT)
+        .await
+        .context("failed to get smtp4dev SMTP port")?;
+    let api_port = container
+        .get_host_port_ipv4(SMTP4DEV_API_PORT)
+        .await
+        .context("failed to get smtp4dev API port")?;
+
+    Ok(SmtpServer {
+        smtp_host: "127.0.0.1".to_string(),
+        smtp_port,
+        api_port,
+        _container: container,
+    })
+}
+
+async fn clear_smtp4dev_messages(api_port: u16) -> Result<()> {
+    reqwest::Client::new()
+        .delete(format!("http://127.0.0.1:{api_port}/api/messages/*"))
+        .send()
+        .await
+        .context("failed to clear smtp4dev messages")?;
+    Ok(())
+}
+
+async fn get_smtp4dev_messages(api_port: u16) -> Result<serde_json::Value> {
+    let resp = reqwest::get(format!("http://127.0.0.1:{api_port}/api/messages"))
+        .await
+        .context("failed to get smtp4dev messages")?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .context("failed to parse smtp4dev response")?;
+    Ok(json)
+}
+
+async fn get_smtp4dev_message_plaintext(api_port: u16, message_id: &str) -> Result<String> {
+    let resp = reqwest::get(format!(
+        "http://127.0.0.1:{api_port}/api/messages/{message_id}/plaintext"
+    ))
+    .await
+    .context("failed to get message plaintext")?;
+    resp.text().await.context("failed to read plaintext body")
+}
+
+async fn get_smtp4dev_message_html(api_port: u16, message_id: &str) -> Result<String> {
+    let resp = reqwest::get(format!(
+        "http://127.0.0.1:{api_port}/api/messages/{message_id}/html"
+    ))
+    .await
+    .context("failed to get message html")?;
+    resp.text().await.context("failed to read html body")
+}
+
+async fn get_smtp4dev_first_message(api_port: u16) -> Result<(String, serde_json::Value)> {
+    let messages = get_smtp4dev_messages(api_port).await?;
+    let results = messages["results"]
+        .as_array()
+        .context("results should be array")?;
+    anyhow::ensure!(!results.is_empty(), "no messages in smtp4dev");
+    let msg = &results[0];
+    let id = msg["id"]
+        .as_str()
+        .context("message should have id")?
+        .to_string();
+    Ok((id, msg.clone()))
+}
+
+async fn get_smtp4dev_message_count(api_port: u16) -> Result<usize> {
+    let json = get_smtp4dev_messages(api_port).await?;
+    let count = json["results"].as_array().map(|a| a.len()).unwrap_or(0);
+    Ok(count)
+}
+
+async fn wait_for_smtp4dev_messages(
+    api_port: u16,
+    expected_count: usize,
+    timeout_duration: Duration,
+) -> Result<usize> {
+    let start = tokio::time::Instant::now();
+    let poll_interval = Duration::from_millis(100);
+
+    loop {
+        let count = get_smtp4dev_message_count(api_port).await?;
+        if count >= expected_count {
+            return Ok(count);
+        }
+        if start.elapsed() >= timeout_duration {
+            anyhow::bail!(
+                "Timed out waiting for {} messages in smtp4dev (got {})",
+                expected_count,
+                count
+            );
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
 
 #[tokio::test]
-async fn test_local_smtp_non_tls() -> Result<()> {
+async fn smtp_sends_plaintext_email() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init()
         .ok();
 
-    let (emails_ref, smtp_port, _smtp_thread) = start_mock_smtp().await?;
-    let (http_addr, _host) = setup_test_host("local-smtp", "local-smtp-test").await?;
+    let server = start_smtp4dev().await?;
+    clear_smtp4dev_messages(server.api_port).await?;
+
+    let (http_addr, _host) = setup_test_host("smtp-test", "plaintext-test").await?;
     let client = reqwest::Client::new();
 
-    // Test 1: Simple plaintext email
-    let payload = local_smtp_payload(
-        smtp_port,
+    let payload = smtp_payload(
+        &server.smtp_host,
+        server.smtp_port,
         "sender@test.local",
         &["recipient@test.local"],
-        "Local SMTP Test - Simple Email",
-        "Hello! This is a test email sent via local non-TLS SMTP server.",
+        "Plaintext Email Test",
+        "Hello, this is a plaintext email.",
     );
-    let (simple_status, _) = send_email(&client, http_addr, "local-smtp", &payload, 10).await?;
-    println!("Simple email: {simple_status}");
+    let (status, _) = send_email(&client, http_addr, "smtp-test", &payload, 15).await?;
 
-    // Test 2: HTML email
-    let payload = local_smtp_payload(
-        smtp_port,
+    assert!(
+        status.is_success(),
+        "plaintext email should succeed, got {status}"
+    );
+
+    let count = wait_for_smtp4dev_messages(server.api_port, 1, Duration::from_secs(5)).await?;
+    assert_eq!(count, 1, "smtp4dev should have captured 1 email");
+
+    let (message_id, summary) = get_smtp4dev_first_message(server.api_port).await?;
+
+    assert_eq!(
+        summary["subject"].as_str().unwrap_or(""),
+        "Plaintext Email Test",
+        "subject should match"
+    );
+    assert!(
+        summary["from"]
+            .as_str()
+            .unwrap_or("")
+            .contains("sender@test.local"),
+        "from should contain sender address"
+    );
+
+    let body = get_smtp4dev_message_plaintext(server.api_port, &message_id).await?;
+    assert!(
+        body.contains("Hello, this is a plaintext email."),
+        "email body should contain the sent text, got: {body}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn smtp_sends_html_email() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init()
+        .ok();
+
+    let server = start_smtp4dev().await?;
+    clear_smtp4dev_messages(server.api_port).await?;
+
+    let (http_addr, _host) = setup_test_host("smtp-html", "html-test").await?;
+    let client = reqwest::Client::new();
+
+    let payload = smtp_payload(
+        &server.smtp_host,
+        server.smtp_port,
         "html-sender@test.local",
         &["html-recipient@test.local"],
-        "Local SMTP Test - HTML Email",
-        "<html><body><h1>HTML Email Test</h1><p>Sent via <strong>local SMTP</strong>.</p></body></html>",
+        "HTML Email Test",
+        "<html><body><h1>HTML Email</h1><p>Sent via <strong>SMTP component</strong>.</p></body></html>",
     );
-    let (html_status, _) = send_email(&client, http_addr, "local-smtp", &payload, 10).await?;
-    println!("HTML email: {html_status}");
+    let (status, _) = send_email(&client, http_addr, "smtp-html", &payload, 15).await?;
 
-    // Test 3: Multiple recipients
-    let payload = local_smtp_payload(
-        smtp_port,
-        "multi-sender@test.local",
-        &["r1@test.local", "r2@test.local", "r3@test.local"],
-        "Local SMTP Test - Multiple Recipients",
-        "This email is sent to multiple recipients via local SMTP.",
+    assert!(
+        status.is_success(),
+        "HTML email should succeed, got {status}"
     );
-    let (multi_status, _) = send_email(&client, http_addr, "local-smtp", &payload, 10).await?;
-    println!("Multi-recipient email: {multi_status}");
 
-    // Test 4: Concurrent emails (5 parallel)
+    let count = wait_for_smtp4dev_messages(server.api_port, 1, Duration::from_secs(5)).await?;
+    assert_eq!(count, 1, "smtp4dev should have captured 1 email");
+
+    let (message_id, summary) = get_smtp4dev_first_message(server.api_port).await?;
+
+    assert_eq!(
+        summary["subject"].as_str().unwrap_or(""),
+        "HTML Email Test",
+        "subject should match"
+    );
+    assert!(
+        summary["from"]
+            .as_str()
+            .unwrap_or("")
+            .contains("html-sender@test.local"),
+        "from should contain sender address"
+    );
+
+    let html = get_smtp4dev_message_html(server.api_port, &message_id).await?;
+    assert!(
+        html.contains("<h1>HTML Email</h1>"),
+        "html body should contain the <h1> tag, got: {html}"
+    );
+    assert!(
+        html.contains("<strong>SMTP component</strong>"),
+        "html body should contain the <strong> tag, got: {html}"
+    );
+
+    let plaintext = get_smtp4dev_message_plaintext(server.api_port, &message_id).await?;
+    assert!(
+        plaintext.contains("SMTP component"),
+        "plaintext fallback should contain 'SMTP component', got: {plaintext}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn smtp_sends_email_with_cc_and_bcc() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init()
+        .ok();
+
+    let server = start_smtp4dev().await?;
+    clear_smtp4dev_messages(server.api_port).await?;
+
+    let (http_addr, _host) = setup_test_host("smtp-cc", "cc-bcc-test").await?;
+    let client = reqwest::Client::new();
+
+    let payload = serde_json::json!({
+        "smtp": { "host": server.smtp_host, "port": server.smtp_port, "tls_mode": "none" },
+        "from": "sender@test.local",
+        "to": ["primary@test.local"],
+        "cc": ["cc1@test.local", "cc2@test.local"],
+        "bcc": ["bcc@test.local"],
+        "subject": "CC and BCC Test",
+        "body": "This email has CC and BCC recipients."
+    });
+    let (status, _) = send_email(&client, http_addr, "smtp-cc", &payload, 15).await?;
+
+    assert!(
+        status.is_success(),
+        "CC/BCC email should succeed, got {status}"
+    );
+
+    let count = wait_for_smtp4dev_messages(server.api_port, 1, Duration::from_secs(5)).await?;
+    assert_eq!(count, 1, "smtp4dev should have captured 1 email");
+
+    let (message_id, summary) = get_smtp4dev_first_message(server.api_port).await?;
+
+    assert_eq!(
+        summary["subject"].as_str().unwrap_or(""),
+        "CC and BCC Test",
+        "subject should match"
+    );
+
+    let plaintext = get_smtp4dev_message_plaintext(server.api_port, &message_id).await?;
+    assert!(
+        plaintext.contains("This email has CC and BCC recipients."),
+        "body should contain expected text, got: {plaintext}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn smtp_sends_concurrent_emails() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init()
+        .ok();
+
+    let server = start_smtp4dev().await?;
+    clear_smtp4dev_messages(server.api_port).await?;
+
+    let (http_addr, _host) = setup_test_host("smtp-concurrent", "concurrent-test").await?;
+
     let mut handles = Vec::new();
     for i in 0..5 {
-        let client = client.clone();
+        let client = reqwest::Client::new();
         let addr = http_addr;
-        let port = smtp_port;
+        let host = server.smtp_host.clone();
+        let port = server.smtp_port;
         handles.push(tokio::spawn(async move {
             let payload = serde_json::json!({
-                "smtp": { "host": "127.0.0.1", "port": port, "tls_mode": "none" },
+                "smtp": { "host": host, "port": port, "tls_mode": "none" },
                 "from": format!("concurrent-{i}@test.local"),
-                "to": [format!("concurrent-rcpt-{i}@test.local")],
+                "to": [format!("recipient-{i}@test.local")],
                 "subject": format!("Concurrent Email #{}", i + 1),
                 "body": format!("Concurrent email number {}.", i + 1)
             });
-            send_email(&client, addr, "local-smtp", &payload, 10)
+            send_email(&client, addr, "smtp-concurrent", &payload, 15)
                 .await
                 .map(|(s, _)| s.is_success())
                 .unwrap_or(false)
         }));
     }
+
     let mut success_count = 0;
     for handle in handles {
         if handle.await.unwrap_or(false) {
             success_count += 1;
         }
     }
-    println!("Concurrent results: {success_count}/5 successful");
 
-    // Allow server to finish processing
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let captured = emails_ref.lock().clone();
+    assert_eq!(success_count, 5, "all 5 concurrent emails should succeed");
 
-    // Assertions
-    assert!(simple_status.is_success(), "Simple email should succeed");
-    assert!(html_status.is_success(), "HTML email should succeed");
-    assert!(
-        multi_status.is_success(),
-        "Multi-recipient email should succeed"
-    );
-    assert!(
-        success_count >= 4,
-        "At least 4/5 concurrent emails should succeed (server is single-threaded), got {success_count}"
-    );
-    // 3 sequential + at least 4 concurrent = at least 7
-    assert!(
-        captured.len() >= 7,
-        "Server should have captured at least 7 emails (3 sequential + 4+ concurrent), got {}",
-        captured.len()
-    );
+    let count = wait_for_smtp4dev_messages(server.api_port, 5, Duration::from_secs(5)).await?;
+    assert_eq!(count, 5, "smtp4dev should have captured all 5 emails");
+
+    let messages = get_smtp4dev_messages(server.api_port).await?;
+    let results = messages["results"]
+        .as_array()
+        .expect("results should be array");
+    let subjects: Vec<&str> = results
+        .iter()
+        .filter_map(|m| m["subject"].as_str())
+        .collect();
+    for i in 1..=5 {
+        let expected = format!("Concurrent Email #{i}");
+        assert!(
+            subjects.contains(&expected.as_str()),
+            "should find '{expected}' in smtp4dev, got subjects: {subjects:?}"
+        );
+    }
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_local_smtp_cc_bcc() -> Result<()> {
+async fn smtp_sends_large_body_email() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init()
         .ok();
 
-    let (emails_ref, smtp_port, _smtp_thread) = start_mock_smtp().await?;
-    let (http_addr, _host) = setup_test_host("cc-bcc-smtp", "cc-bcc-test").await?;
+    let server = start_smtp4dev().await?;
+    clear_smtp4dev_messages(server.api_port).await?;
+
+    let (http_addr, _host) = setup_test_host("smtp-large", "large-body-test").await?;
     let client = reqwest::Client::new();
 
-    // Test 1: Email with CC recipients (to=1 + cc=2 = 3 RCPT TO envelopes)
-    let cc_payload = serde_json::json!({
-        "smtp": { "host": "127.0.0.1", "port": smtp_port, "tls_mode": "none" },
-        "from": "sender@test.local",
-        "to": ["primary@test.local"],
-        "cc": ["cc1@test.local", "cc2@test.local"],
-        "subject": "Local SMTP Test - With CC",
-        "body": "This email has CC recipients."
-    });
-    let (cc_status, _) = send_email(&client, http_addr, "cc-bcc-smtp", &cc_payload, 10).await?;
-    println!("CC email: {cc_status}");
-
-    // Test 2: Email with BCC recipients (to=1 + bcc=2 = 3 RCPT TO envelopes)
-    let bcc_payload = serde_json::json!({
-        "smtp": { "host": "127.0.0.1", "port": smtp_port, "tls_mode": "none" },
-        "from": "sender@test.local",
-        "to": ["primary@test.local"],
-        "bcc": ["bcc1@test.local", "bcc2@test.local"],
-        "subject": "Local SMTP Test - With BCC",
-        "body": "This email has BCC recipients (hidden)."
-    });
-    let (bcc_status, _) = send_email(&client, http_addr, "cc-bcc-smtp", &bcc_payload, 10).await?;
-    println!("BCC email: {bcc_status}");
-
-    // Test 3: Email with both CC and BCC (to=1 + cc=1 + bcc=1 = 3 RCPT TO envelopes)
-    let both_payload = serde_json::json!({
-        "smtp": { "host": "127.0.0.1", "port": smtp_port, "tls_mode": "none" },
-        "from": "sender@test.local",
-        "to": ["primary@test.local"],
-        "cc": ["cc@test.local"],
-        "bcc": ["bcc@test.local"],
-        "subject": "Local SMTP Test - With CC and BCC",
-        "body": "This email has both CC and BCC recipients."
-    });
-    let (both_status, _) = send_email(&client, http_addr, "cc-bcc-smtp", &both_payload, 10).await?;
-    println!("CC+BCC email: {both_status}");
-
-    // Allow server to finish processing
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let captured = emails_ref.lock().clone();
-
-    // Assertions: HTTP responses succeeded
-    assert!(cc_status.is_success(), "CC email should succeed");
-    assert!(bcc_status.is_success(), "BCC email should succeed");
-    assert!(both_status.is_success(), "CC+BCC email should succeed");
-    assert_eq!(
-        captured.len(),
-        3,
-        "Server should have captured exactly 3 emails, got {}",
-        captured.len()
-    );
-
-    // Verify that CC/BCC recipients appear in the SMTP envelope (RCPT TO)
-    let cc_email = &captured[0];
-    assert!(
-        cc_email.to.iter().any(|r| r.contains("cc1@test.local")),
-        "CC email should have cc1 in RCPT TO, got: {:?}",
-        cc_email.to
-    );
-    assert!(
-        cc_email.to.iter().any(|r| r.contains("cc2@test.local")),
-        "CC email should have cc2 in RCPT TO, got: {:?}",
-        cc_email.to
-    );
-
-    let bcc_email = &captured[1];
-    assert!(
-        bcc_email.to.iter().any(|r| r.contains("bcc1@test.local")),
-        "BCC email should have bcc1 in RCPT TO, got: {:?}",
-        bcc_email.to
-    );
-    assert!(
-        bcc_email.to.iter().any(|r| r.contains("bcc2@test.local")),
-        "BCC email should have bcc2 in RCPT TO, got: {:?}",
-        bcc_email.to
-    );
-
-    let both_email = &captured[2];
-    assert!(
-        both_email.to.iter().any(|r| r.contains("cc@test.local")),
-        "CC+BCC email should have cc in RCPT TO, got: {:?}",
-        both_email.to
-    );
-    assert!(
-        both_email.to.iter().any(|r| r.contains("bcc@test.local")),
-        "CC+BCC email should have bcc in RCPT TO, got: {:?}",
-        both_email.to
-    );
-
-    Ok(())
-}
-
-/// Test that a large email body (~50KB) is received intact by the SMTP server.
-#[tokio::test]
-async fn test_local_smtp_large_body() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init()
-        .ok();
-
-    let (emails_ref, smtp_port, _smtp_thread) = start_mock_smtp().await?;
-    let (http_addr, _host) = setup_test_host("large-body-smtp", "large-body-test").await?;
-    let client = reqwest::Client::new();
-
-    // Generate a large HTML body (~72KB)
     let large_body = {
-        let mut body = String::from("<html><body><h1>Large Email Test</h1>");
+        let mut body = String::from("<html><body><h1>Large Email</h1>");
         for i in 0..500 {
             body.push_str(&format!(
-                "<p>Paragraph {i}: Lorem ipsum dolor sit amet, consectetur adipiscing elit. \
-                 Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>",
+                "<p>Paragraph {i}: Lorem ipsum dolor sit amet, consectetur adipiscing elit.</p>",
             ));
         }
         body.push_str("</body></html>");
         body
     };
-    println!("Large body size: {} bytes", large_body.len());
 
-    let payload = local_smtp_payload(
-        smtp_port,
+    let payload = smtp_payload(
+        &server.smtp_host,
+        server.smtp_port,
         "large-sender@test.local",
         &["large-recipient@test.local"],
-        "Local SMTP Test - Large Body Email",
+        "Large Body Email Test",
         &large_body,
     );
-    let (status, _) = send_email(&client, http_addr, "large-body-smtp", &payload, 30).await?;
-    println!("Large body email: {status}");
+    let (status, _) = send_email(&client, http_addr, "smtp-large", &payload, 30).await?;
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let captured = emails_ref.lock().clone();
-
-    let data_received = captured.first().map(|e| e.data.len()).unwrap_or(0);
-    println!("Data received by server: {data_received} bytes");
-
-    assert!(status.is_success(), "Large body email should succeed");
     assert!(
-        data_received > large_body.len() / 2,
-        "Server should have received substantial email data, got {data_received} bytes \
-         (body was {} bytes)",
-        large_body.len()
+        status.is_success(),
+        "large body email should succeed, got {status}"
+    );
+
+    let count = wait_for_smtp4dev_messages(server.api_port, 1, Duration::from_secs(5)).await?;
+    assert_eq!(count, 1, "smtp4dev should have captured 1 email");
+
+    let (message_id, summary) = get_smtp4dev_first_message(server.api_port).await?;
+
+    assert_eq!(
+        summary["subject"].as_str().unwrap_or(""),
+        "Large Body Email Test",
+        "subject should match"
+    );
+
+    let html = get_smtp4dev_message_html(server.api_port, &message_id).await?;
+    assert!(
+        html.contains("<h1>Large Email</h1>"),
+        "html should contain the heading"
+    );
+    assert!(
+        html.contains("Paragraph 0:") && html.contains("Paragraph 499:"),
+        "html should contain first and last paragraphs"
     );
 
     Ok(())
 }
 
-/// Test that the component returns an error when the SMTP server is unreachable.
 #[tokio::test]
-async fn test_local_smtp_error_handling() -> Result<()> {
+async fn smtp_returns_error_for_unreachable_server() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init()
         .ok();
 
-    // No SMTP server started intentionally
-    let (http_addr, _host) = setup_test_host("error-smtp", "error-test").await?;
+    let (http_addr, _host) = setup_test_host("smtp-error", "error-test").await?;
     let client = reqwest::Client::new();
 
     let invalid_port = find_available_port().await?;
-    let payload = local_smtp_payload(
+    let payload = smtp_payload(
+        "127.0.0.1",
         invalid_port,
         "sender@test.local",
         &["recipient@test.local"],
-        "Should Fail - No Server",
-        "This email should fail because there's no SMTP server.",
+        "Should Fail",
+        "This email should fail because there is no SMTP server.",
     );
-    let (status, text) = send_email(&client, http_addr, "error-smtp", &payload, 15).await?;
-    println!("Connection refused: {status} | {}", text.trim());
+    let (status, _) = send_email(&client, http_addr, "smtp-error", &payload, 15).await?;
 
     assert!(
         status.as_u16() >= 400,
-        "Connection to non-existent server should return error status, got {status}"
+        "connection to non-existent server should return error status, got {status}"
     );
 
     Ok(())
+}
+
+#[tokio::test]
+async fn smtp_reconnects_after_disconnect() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init()
+        .ok();
+
+    let server = start_smtp4dev().await?;
+    clear_smtp4dev_messages(server.api_port).await?;
+
+    let (http_addr, _host) = setup_test_host("smtp-reconn", "reconnect-test").await?;
+    let client = reqwest::Client::new();
+
+    let payload1 = smtp_payload(
+        &server.smtp_host,
+        server.smtp_port,
+        "sender@test.local",
+        &["recipient@test.local"],
+        "First Email",
+        "First email body.",
+    );
+    let (status1, _) = send_email(&client, http_addr, "smtp-reconn", &payload1, 15).await?;
+    assert!(
+        status1.is_success(),
+        "first send should succeed, got {status1}"
+    );
+
+    let payload2 = smtp_payload(
+        &server.smtp_host,
+        server.smtp_port,
+        "sender@test.local",
+        &["recipient@test.local"],
+        "Second Email",
+        "Second email body.",
+    );
+    let (status2, _) = send_email(&client, http_addr, "smtp-reconn", &payload2, 15).await?;
+    assert!(
+        status2.is_success(),
+        "second send should succeed after reconnect, got {status2}"
+    );
+
+    let count = wait_for_smtp4dev_messages(server.api_port, 2, Duration::from_secs(5)).await?;
+    assert_eq!(count, 2, "smtp4dev should have captured 2 emails");
+
+    let messages = get_smtp4dev_messages(server.api_port).await?;
+    let results = messages["results"]
+        .as_array()
+        .expect("results should be array");
+    let subjects: Vec<&str> = results
+        .iter()
+        .filter_map(|m| m["subject"].as_str())
+        .collect();
+    assert!(
+        subjects.contains(&"First Email") && subjects.contains(&"Second Email"),
+        "should find both email subjects, got: {subjects:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn smtp_sends_email_with_attachment() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init()
+        .ok();
+
+    let server = start_smtp4dev().await?;
+    clear_smtp4dev_messages(server.api_port).await?;
+
+    let attachment_port = find_available_port().await?;
+    let attachment_bytes = b"Hello, this is a test attachment file content.";
+
+    spawn_attachment_server(attachment_port, attachment_bytes).await?;
+
+    let (http_addr, _host) = setup_test_host("smtp-attach", "attachment-test").await?;
+    let client = reqwest::Client::new();
+
+    let payload = serde_json::json!({
+        "smtp": { "host": server.smtp_host, "port": server.smtp_port, "tls_mode": "none" },
+        "from": "sender@test.local",
+        "to": ["recipient@test.local"],
+        "subject": "Attachment Test",
+        "body": "This email has an attachment.",
+        "attachments": [{
+            "url": format!("http://127.0.0.1:{}/test.txt", attachment_port),
+            "filename": "test.txt",
+            "content_type": "text/plain"
+        }]
+    });
+
+    let (status, _) = send_email(&client, http_addr, "smtp-attach", &payload, 30).await?;
+    assert!(
+        status.is_success(),
+        "attachment email should succeed, got {status}"
+    );
+
+    let count = wait_for_smtp4dev_messages(server.api_port, 1, Duration::from_secs(5)).await?;
+    assert_eq!(count, 1, "smtp4dev should have captured 1 email");
+
+    let (message_id, summary) = get_smtp4dev_first_message(server.api_port).await?;
+
+    assert_eq!(summary["subject"].as_str().unwrap_or(""), "Attachment Test");
+    assert_eq!(summary["attachmentCount"].as_i64().unwrap_or(0), 1);
+
+    let plaintext = get_smtp4dev_message_plaintext(server.api_port, &message_id).await?;
+    assert!(
+        plaintext.contains("This email has an attachment."),
+        "body should contain expected text, got: {plaintext}"
+    );
+
+    Ok(())
+}
+
+async fn spawn_attachment_server(
+    port: u16,
+    attachment_bytes: &'static [u8],
+) -> Result<JoinHandle<()>> {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
+
+    let handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+                    attachment_bytes.len()
+                );
+
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(attachment_bytes).await;
+            }
+        }
+    });
+
+    Ok(handle)
 }

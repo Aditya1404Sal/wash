@@ -90,5 +90,4 @@ tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 gag = "1.0"
-mailin-embedded = { version = "0.8.3", features = ["ossl"] }
-parking_lot = "0.12"
+testcontainers = "0.23"

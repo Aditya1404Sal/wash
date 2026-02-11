@@ -47,9 +47,7 @@ interface client {
         message-id: option<string>,
     }
 
-    resource smtp-client {
-        connect: static func(creds: credentials) -> result<smtp-client, string>;
-        send: func(msg: message) -> result<send-result, string>;
-        disconnect: func() -> result<_, string>;
-    }
+    connect: func(creds: credentials) -> result<string, string>;
+    send: func(connection-key: string, msg: message) -> result<send-result, string>;
+    disconnect: func(connection-key: string) -> result<_, string>;
 }
