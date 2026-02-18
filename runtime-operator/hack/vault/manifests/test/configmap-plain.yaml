@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-servers-config
+  namespace: wasmcloud-system
+data:
+  SERVICE_NAME: "mcp-test-workload"
+  REGION: "us-west-2"
+  LOG_LEVEL: "debug"

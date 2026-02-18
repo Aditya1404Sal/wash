@@ -127,4 +127,17 @@ impl HostPlugin for WasiConfig {
 
         Ok(())
     }
+
+    async fn update_config(
+        &self,
+        component_id: &str,
+        config: HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        tracing::debug!(component_id, "hot-updating wasi:config/store");
+        self.config
+            .write()
+            .await
+            .insert(Arc::from(component_id), config);
+        Ok(())
+    }
 }

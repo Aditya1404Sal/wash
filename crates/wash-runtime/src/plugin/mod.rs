@@ -193,4 +193,27 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     async fn stop(&self) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Called when configuration for a component is updated at runtime.
+    ///
+    /// This allows plugins to react to hot configuration changes without
+    /// requiring a workload restart. The default implementation does nothing.
+    ///
+    /// Plugins that maintain per-component configuration (like `WasiConfig`)
+    /// should override this to update their internal state so that subsequent
+    /// calls from the component see the new values.
+    ///
+    /// # Arguments
+    /// * `component_id` - The ID of the component whose config changed
+    /// * `config` - The new configuration key-value pairs
+    ///
+    /// # Returns
+    /// Ok if the config was updated successfully.
+    async fn update_config(
+        &self,
+        _component_id: &str,
+        _config: std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }

@@ -193,3 +193,19 @@ pub struct WorkloadStopRequest {
 pub struct WorkloadStopResponse {
     pub workload_status: WorkloadStatus,
 }
+
+/// Request to hot-update configuration for a running workload.
+/// Updates the `wasi:config/store` plugin values without restarting the workload.
+/// Does NOT update `wasi:cli/environment` (env vars are static per invocation).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkloadUpdateConfigRequest {
+    pub workload_id: String,
+    /// The new merged configuration (inline + configFrom + secretFrom).
+    pub environment: HashMap<String, String>,
+}
+
+/// Response after attempting to update workload configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkloadUpdateConfigResponse {
+    pub workload_status: WorkloadStatus,
+}

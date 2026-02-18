@@ -451,6 +451,11 @@ spec:
                   - type
                   type: object
                 type: array
+              configHash:
+                description: |-
+                  ConfigHash stores a hash of the last-pushed config environment so we can
+                  detect when Secrets/ConfigMaps change and trigger a hot config update.
+                type: string
               hostId:
                 type: string
               workloadId:

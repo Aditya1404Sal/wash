@@ -117,6 +117,25 @@ pub trait HostApi {
         &self,
         request: WorkloadStopRequest,
     ) -> impl Future<Output = anyhow::Result<WorkloadStopResponse>>;
+
+    /// Hot-update configuration for a running workload without restart.
+    ///
+    /// Updates the `wasi:config/store` plugin's in-memory config map so that
+    /// subsequent component `get()` calls see the new values immediately.
+    /// Does NOT update `wasi:cli/environment` (env vars are static per invocation).
+    ///
+    /// # Arguments
+    /// * `request` - Contains the workload ID and new environment config
+    ///
+    /// # Returns
+    /// A `WorkloadUpdateConfigResponse` with the status of the workload.
+    ///
+    /// # Errors
+    /// Returns an error if the workload is not found or not running.
+    fn workload_update_config(
+        &self,
+        request: WorkloadUpdateConfigRequest,
+    ) -> impl Future<Output = anyhow::Result<WorkloadUpdateConfigResponse>>;
 }
 
 // Helper trait impl that helps with Arc-ing the Host
@@ -141,6 +160,12 @@ impl<T: HostApi> HostApi for Arc<T> {
         request: WorkloadStatusRequest,
     ) -> anyhow::Result<WorkloadStatusResponse> {
         self.as_ref().workload_status(request).await
+    }
+    async fn workload_update_config(
+        &self,
+        request: WorkloadUpdateConfigRequest,
+    ) -> anyhow::Result<WorkloadUpdateConfigResponse> {
+        self.as_ref().workload_update_config(request).await
     }
 }
 
@@ -602,6 +627,46 @@ impl HostApi for Host {
                 workload_id: request.workload_id,
                 workload_state,
                 message,
+            },
+        })
+    }
+
+    async fn workload_update_config(
+        &self,
+        request: WorkloadUpdateConfigRequest,
+    ) -> anyhow::Result<WorkloadUpdateConfigResponse> {
+        let workloads = self.workloads.read().await;
+        let Some(HostWorkload::Running(workload)) = workloads.get(&request.workload_id) else {
+            bail!(
+                "workload not running or not found: {}",
+                request.workload_id
+            );
+        };
+
+        // Update the wasi:config/store plugin for each component with the new config
+        let components_lock = workload.components();
+        let components = components_lock.read().await;
+        for (component_id, component) in components.iter() {
+            if let Some(plugins) = component.metadata().plugins() {
+                if let Some(plugin) = plugins.get("wasi-config") {
+                    plugin
+                        .update_config(component_id, request.environment.clone())
+                        .await?;
+                }
+            }
+        }
+
+        debug!(
+            workload_id = request.workload_id,
+            component_count = components.len(),
+            "hot-updated config for workload"
+        );
+
+        Ok(WorkloadUpdateConfigResponse {
+            workload_status: WorkloadStatus {
+                workload_id: request.workload_id,
+                workload_state: WorkloadState::Running,
+                message: "Config updated successfully".to_string(),
             },
         })
     }

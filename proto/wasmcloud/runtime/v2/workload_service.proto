@@ -9,6 +9,11 @@ service WorkloadService {
   rpc WorkloadStart(WorkloadStartRequest) returns (WorkloadStartResponse);
   rpc WorkloadStatus(WorkloadStatusRequest) returns (WorkloadStatusResponse);
   rpc WorkloadStop(WorkloadStopRequest) returns (WorkloadStopResponse);
+  // Hot-update configuration for a running workload without restart.
+  // Updates the wasi:config/store plugin's in-memory config map so that
+  // subsequent component get() calls see the new values immediately.
+  // Does NOT update wasi:cli/environment (env vars are static per invocation).
+  rpc WorkloadUpdateConfig(WorkloadUpdateConfigRequest) returns (WorkloadUpdateConfigResponse);
 }
 
 message WorkloadStartRequest {
@@ -38,5 +43,19 @@ message WorkloadStopRequest {
 }
 
 message WorkloadStopResponse {
+  WorkloadStatus workload_status = 1;
+}
+
+// Request to hot-update configuration for a running workload.
+// The environment map replaces the current wasi:config/store values
+// for all components in the workload.
+message WorkloadUpdateConfigRequest {
+  string workload_id = 1;
+  // The new merged configuration (inline + configFrom + secretFrom).
+  // This replaces the existing config for each component's wasi:config/store.
+  map<string, string> environment = 2;
+}
+
+message WorkloadUpdateConfigResponse {
   WorkloadStatus workload_status = 1;
 }

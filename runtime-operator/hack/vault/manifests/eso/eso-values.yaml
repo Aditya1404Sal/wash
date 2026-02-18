@@ -1,0 +1,4 @@
+installCRDs: true
+replicaCount: 1
+serviceAccount:
+  name: external-secrets

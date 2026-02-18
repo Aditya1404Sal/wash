@@ -11,6 +11,7 @@ const (
 	WorkloadConditionPlacement     condition.ConditionType = "Placement"
 	WorkloadConditionConfig        condition.ConditionType = "Config"
 	WorkloadConditionSync          condition.ConditionType = "Sync"
+	WorkloadConditionConfigSync    condition.ConditionType = "ConfigSync"
 )
 
 // EphemeralVolume represents a temporary directory that shares a workload's lifetime.
@@ -192,6 +193,10 @@ type WorkloadStatus struct {
 	HostID string `json:"hostId,omitempty"`
 	// +kubebuilder:validation:Optional
 	WorkloadID string `json:"workloadId,omitempty"`
+	// ConfigHash stores a hash of the last-pushed config environment so we can
+	// detect when Secrets/ConfigMaps change and trigger a hot config update.
+	// +kubebuilder:validation:Optional
+	ConfigHash string `json:"configHash,omitempty"`
 }
 
 // +kubebuilder:object:root=true

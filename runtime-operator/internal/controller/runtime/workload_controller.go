@@ -271,6 +271,18 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 		},
 	}
 
+	// Compute initial config hash from all materialized environments so that
+	// reconcileConfigSync doesn't trigger a spurious update on the first pass.
+	initialConfig := make(map[string]string)
+	if service != nil && service.LocalResources != nil {
+		initialConfig = MergeMaps(initialConfig, service.LocalResources.Environment)
+	}
+	for _, c := range witWorld.Components {
+		if c.LocalResources != nil {
+			initialConfig = MergeMaps(initialConfig, c.LocalResources.Environment)
+		}
+	}
+
 	client := NewWashHostClient(r.Bus, workload.Status.HostID)
 	ctx, cancel := context.WithTimeout(ctx, workloadStartTimeout)
 	defer cancel()
@@ -280,10 +292,68 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 		return err
 	}
 
-	// Set the WorkloadID in the status
+	// Set the WorkloadID and initial config hash in the status
 	workload.Status.WorkloadID = resp.WorkloadStatus.WorkloadId
+	workload.Status.ConfigHash = HashConfig(initialConfig)
 	condition.ForceStatusUpdate(ctx)
 	return condition.ErrSkipReconciliation()
+}
+
+func (r *WorkloadReconciler) reconcileConfigSync(ctx context.Context, workload *runtimev1alpha1.Workload) error {
+	if !workload.Status.AllTrue(runtimev1alpha1.WorkloadConditionPlacement, runtimev1alpha1.WorkloadConditionSync) {
+		return condition.ErrStatusUnknown(fmt.Errorf("waiting for workload to be placed and running"))
+	}
+
+	// Re-materialize the full config from all sources (inline + ConfigMaps + Secrets)
+	mergedConfig := make(map[string]string)
+
+	if workload.Spec.Service != nil && workload.Spec.Service.LocalResources != nil {
+		cfg, err := MaterializeConfigLayer(ctx, r.Client, workload.Namespace, workload.Spec.Service.LocalResources.Environment)
+		if err != nil {
+			return fmt.Errorf("materializing service config for config sync: %w", err)
+		}
+		mergedConfig = MergeMaps(mergedConfig, cfg)
+	}
+
+	for _, c := range workload.Spec.Components {
+		if c.LocalResources != nil && c.LocalResources.Environment != nil {
+			cfg, err := MaterializeConfigLayer(ctx, r.Client, workload.Namespace, c.LocalResources.Environment)
+			if err != nil {
+				return fmt.Errorf("materializing component %q config for config sync: %w", c.Name, err)
+			}
+			mergedConfig = MergeMaps(mergedConfig, cfg)
+		}
+	}
+
+	newHash := HashConfig(mergedConfig)
+
+	// If the hash hasn't changed, nothing to do
+	if workload.Status.ConfigHash == newHash {
+		return nil
+	}
+
+	logger := ctrl.LoggerFrom(ctx)
+	logger.Info("config change detected, sending hot update",
+		"workloadID", workload.Status.WorkloadID,
+		"oldHash", workload.Status.ConfigHash,
+		"newHash", newHash,
+	)
+
+	client := NewWashHostClient(r.Bus, workload.Status.HostID)
+	updateCtx, cancel := context.WithTimeout(ctx, workloadStatusTimeout)
+	defer cancel()
+
+	_, err := client.UpdateConfig(updateCtx, &runtimev2.WorkloadUpdateConfigRequest{
+		WorkloadId:  workload.Status.WorkloadID,
+		Environment: mergedConfig,
+	})
+	if err != nil {
+		return fmt.Errorf("hot-updating workload config: %w", err)
+	}
+
+	workload.Status.ConfigHash = newHash
+	condition.ForceStatusUpdate(ctx)
+	return nil
 }
 
 func (r *WorkloadReconciler) reconcileSync(ctx context.Context, workload *runtimev1alpha1.Workload) error {
@@ -312,8 +382,8 @@ func (r *WorkloadReconciler) reconcileSync(ctx context.Context, workload *runtim
 }
 
 func (r *WorkloadReconciler) reconcileReady(_ context.Context, workload *runtimev1alpha1.Workload) error {
-	if !workload.Status.AllTrue(runtimev1alpha1.WorkloadConditionPlacement, runtimev1alpha1.WorkloadConditionSync) {
-		return fmt.Errorf("workload is not placed or not synced")
+	if !workload.Status.AllTrue(runtimev1alpha1.WorkloadConditionPlacement, runtimev1alpha1.WorkloadConditionSync, runtimev1alpha1.WorkloadConditionConfigSync) {
+		return fmt.Errorf("workload is not placed, not synced, or config not synced")
 	}
 
 	return nil
@@ -348,6 +418,8 @@ func (r *WorkloadReconciler) finalize(ctx context.Context, workload *runtimev1al
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=workloads,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=workloads/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=runtime.wasmcloud.dev,resources=workloads/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	reconciler := condition.NewConditionedReconciler(
@@ -361,6 +433,7 @@ func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	reconciler.SetCondition(runtimev1alpha1.WorkloadConditionHostSelection, r.reconcileHostSelection)
 	reconciler.SetCondition(runtimev1alpha1.WorkloadConditionPlacement, r.reconcilePlacement)
 	reconciler.SetCondition(runtimev1alpha1.WorkloadConditionSync, r.reconcileSync)
+	reconciler.SetCondition(runtimev1alpha1.WorkloadConditionConfigSync, r.reconcileConfigSync)
 	reconciler.SetCondition(condition.TypeReady, r.reconcileReady)
 
 	r.reconciler = reconciler

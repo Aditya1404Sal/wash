@@ -42,6 +42,9 @@ const (
 	// WorkloadServiceWorkloadStopProcedure is the fully-qualified name of the WorkloadService's
 	// WorkloadStop RPC.
 	WorkloadServiceWorkloadStopProcedure = "/wasmcloud.runtime.v2.WorkloadService/WorkloadStop"
+	// WorkloadServiceWorkloadUpdateConfigProcedure is the fully-qualified name of the WorkloadService's
+	// WorkloadUpdateConfig RPC.
+	WorkloadServiceWorkloadUpdateConfigProcedure = "/wasmcloud.runtime.v2.WorkloadService/WorkloadUpdateConfig"
 )
 
 // WorkloadServiceClient is a client for the wasmcloud.runtime.v2.WorkloadService service.
@@ -49,6 +52,11 @@ type WorkloadServiceClient interface {
 	WorkloadStart(context.Context, *connect.Request[v2.WorkloadStartRequest]) (*connect.Response[v2.WorkloadStartResponse], error)
 	WorkloadStatus(context.Context, *connect.Request[v2.WorkloadStatusRequest]) (*connect.Response[v2.WorkloadStatusResponse], error)
 	WorkloadStop(context.Context, *connect.Request[v2.WorkloadStopRequest]) (*connect.Response[v2.WorkloadStopResponse], error)
+	// Hot-update configuration for a running workload without restart.
+	// Updates the wasi:config/store plugin's in-memory config map so that
+	// subsequent component get() calls see the new values immediately.
+	// Does NOT update wasi:cli/environment (env vars are static per invocation).
+	WorkloadUpdateConfig(context.Context, *connect.Request[v2.WorkloadUpdateConfigRequest]) (*connect.Response[v2.WorkloadUpdateConfigResponse], error)
 }
 
 // NewWorkloadServiceClient constructs a client for the wasmcloud.runtime.v2.WorkloadService
@@ -80,14 +88,21 @@ func NewWorkloadServiceClient(httpClient connect.HTTPClient, baseURL string, opt
 			connect.WithSchema(workloadServiceMethods.ByName("WorkloadStop")),
 			connect.WithClientOptions(opts...),
 		),
+		workloadUpdateConfig: connect.NewClient[v2.WorkloadUpdateConfigRequest, v2.WorkloadUpdateConfigResponse](
+			httpClient,
+			baseURL+WorkloadServiceWorkloadUpdateConfigProcedure,
+			connect.WithSchema(workloadServiceMethods.ByName("WorkloadUpdateConfig")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
 // workloadServiceClient implements WorkloadServiceClient.
 type workloadServiceClient struct {
-	workloadStart  *connect.Client[v2.WorkloadStartRequest, v2.WorkloadStartResponse]
-	workloadStatus *connect.Client[v2.WorkloadStatusRequest, v2.WorkloadStatusResponse]
-	workloadStop   *connect.Client[v2.WorkloadStopRequest, v2.WorkloadStopResponse]
+	workloadStart        *connect.Client[v2.WorkloadStartRequest, v2.WorkloadStartResponse]
+	workloadStatus       *connect.Client[v2.WorkloadStatusRequest, v2.WorkloadStatusResponse]
+	workloadStop         *connect.Client[v2.WorkloadStopRequest, v2.WorkloadStopResponse]
+	workloadUpdateConfig *connect.Client[v2.WorkloadUpdateConfigRequest, v2.WorkloadUpdateConfigResponse]
 }
 
 // WorkloadStart calls wasmcloud.runtime.v2.WorkloadService.WorkloadStart.
@@ -105,11 +120,21 @@ func (c *workloadServiceClient) WorkloadStop(ctx context.Context, req *connect.R
 	return c.workloadStop.CallUnary(ctx, req)
 }
 
+// WorkloadUpdateConfig calls wasmcloud.runtime.v2.WorkloadService.WorkloadUpdateConfig.
+func (c *workloadServiceClient) WorkloadUpdateConfig(ctx context.Context, req *connect.Request[v2.WorkloadUpdateConfigRequest]) (*connect.Response[v2.WorkloadUpdateConfigResponse], error) {
+	return c.workloadUpdateConfig.CallUnary(ctx, req)
+}
+
 // WorkloadServiceHandler is an implementation of the wasmcloud.runtime.v2.WorkloadService service.
 type WorkloadServiceHandler interface {
 	WorkloadStart(context.Context, *connect.Request[v2.WorkloadStartRequest]) (*connect.Response[v2.WorkloadStartResponse], error)
 	WorkloadStatus(context.Context, *connect.Request[v2.WorkloadStatusRequest]) (*connect.Response[v2.WorkloadStatusResponse], error)
 	WorkloadStop(context.Context, *connect.Request[v2.WorkloadStopRequest]) (*connect.Response[v2.WorkloadStopResponse], error)
+	// Hot-update configuration for a running workload without restart.
+	// Updates the wasi:config/store plugin's in-memory config map so that
+	// subsequent component get() calls see the new values immediately.
+	// Does NOT update wasi:cli/environment (env vars are static per invocation).
+	WorkloadUpdateConfig(context.Context, *connect.Request[v2.WorkloadUpdateConfigRequest]) (*connect.Response[v2.WorkloadUpdateConfigResponse], error)
 }
 
 // NewWorkloadServiceHandler builds an HTTP handler from the service implementation. It returns the
@@ -137,6 +162,12 @@ func NewWorkloadServiceHandler(svc WorkloadServiceHandler, opts ...connect.Handl
 		connect.WithSchema(workloadServiceMethods.ByName("WorkloadStop")),
 		connect.WithHandlerOptions(opts...),
 	)
+	workloadServiceWorkloadUpdateConfigHandler := connect.NewUnaryHandler(
+		WorkloadServiceWorkloadUpdateConfigProcedure,
+		svc.WorkloadUpdateConfig,
+		connect.WithSchema(workloadServiceMethods.ByName("WorkloadUpdateConfig")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/wasmcloud.runtime.v2.WorkloadService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case WorkloadServiceWorkloadStartProcedure:
@@ -145,6 +176,8 @@ func NewWorkloadServiceHandler(svc WorkloadServiceHandler, opts ...connect.Handl
 			workloadServiceWorkloadStatusHandler.ServeHTTP(w, r)
 		case WorkloadServiceWorkloadStopProcedure:
 			workloadServiceWorkloadStopHandler.ServeHTTP(w, r)
+		case WorkloadServiceWorkloadUpdateConfigProcedure:
+			workloadServiceWorkloadUpdateConfigHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -164,4 +197,8 @@ func (UnimplementedWorkloadServiceHandler) WorkloadStatus(context.Context, *conn
 
 func (UnimplementedWorkloadServiceHandler) WorkloadStop(context.Context, *connect.Request[v2.WorkloadStopRequest]) (*connect.Response[v2.WorkloadStopResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("wasmcloud.runtime.v2.WorkloadService.WorkloadStop is not implemented"))
+}
+
+func (UnimplementedWorkloadServiceHandler) WorkloadUpdateConfig(context.Context, *connect.Request[v2.WorkloadUpdateConfigRequest]) (*connect.Response[v2.WorkloadUpdateConfigResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("wasmcloud.runtime.v2.WorkloadService.WorkloadUpdateConfig is not implemented"))
 }

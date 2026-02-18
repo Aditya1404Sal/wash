@@ -68,6 +68,14 @@ func (w *WashHostClient) Stop(ctx context.Context, req *runtimev2.WorkloadStopRe
 	return &resp, nil
 }
 
+func (w *WashHostClient) UpdateConfig(ctx context.Context, req *runtimev2.WorkloadUpdateConfigRequest) (*runtimev2.WorkloadUpdateConfigResponse, error) {
+	var resp runtimev2.WorkloadUpdateConfigResponse
+	if err := RoundTrip(ctx, w.Bus, w.subject("workload.update_config"), req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // RoundTrip sends a request and waits for a response.
 func RoundTrip[Req proto.Message, Resp proto.Message](ctx context.Context, bus wasmbus.Bus, subject string, req Req, resp Resp) error {
 	ctx, cancel := context.WithTimeout(ctx, HostRoundtripTimeout)

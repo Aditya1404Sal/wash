@@ -2,8 +2,10 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"strings"
 
 	"github.com/distribution/reference"
@@ -140,6 +142,25 @@ func getAuthConfigKey(domainName string) string {
 		return "https://index.docker.io/v1/"
 	}
 	return domainName
+}
+
+// HashConfig produces a deterministic SHA-256 hash of a config map so we can
+// detect when the materialized config has changed between reconcile loops.
+func HashConfig(config map[string]string) string {
+	keys := make([]string, 0, len(config))
+	for k := range config {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write([]byte(k))
+		h.Write([]byte{0})
+		h.Write([]byte(config[k]))
+		h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func MaterializeConfigLayer(ctx context.Context,

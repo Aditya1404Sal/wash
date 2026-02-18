@@ -135,7 +135,8 @@ func (h *hostStatusUpdater) Start(ctx context.Context) error {
 
 	go subscription.Handle(func(msg *wasmbus.Message) {
 		var req runtimev2.HostHeartbeat
-		if err := protojson.Unmarshal(msg.Data, &req); err != nil {
+		unmarshaler := protojson.UnmarshalOptions{DiscardUnknown: true}
+		if err := unmarshaler.Unmarshal(msg.Data, &req); err != nil {
 			fmt.Println("Failed to decode heartbeat message:", err)
 			return
 		}

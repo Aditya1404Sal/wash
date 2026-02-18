@@ -255,6 +255,11 @@ async fn handle_command(
             let res = workload_status(host, req).await?;
             to_api(&res)
         }
+        "workload.update_config" => {
+            let req: types::v2::WorkloadUpdateConfigRequest = from_api(payload)?;
+            let res = workload_update_config(host, req).await?;
+            to_api(&res)
+        }
         // catch-all
         _ => anyhow::bail!("unknown command: {command}"),
     }
@@ -411,6 +416,20 @@ async fn workload_status(
         "Fetching workload status");
 
     host.workload_status(req.into())
+        .await
+        .map(|resp| resp.into())
+}
+
+async fn workload_update_config(
+    host: &impl HostApi,
+    req: types::v2::WorkloadUpdateConfigRequest,
+) -> anyhow::Result<types::v2::WorkloadUpdateConfigResponse> {
+    info!(
+        workload_id=?req.workload_id,
+        config_keys=?req.environment.keys().collect::<Vec<_>>(),
+        "Hot-updating workload config");
+
+    host.workload_update_config(req.into())
         .await
         .map(|resp| resp.into())
 }
@@ -605,6 +624,23 @@ impl From<crate::types::WorkloadStatus> for types::v2::WorkloadStatus {
             workload_id: status.workload_id,
             workload_state: status.workload_state as i32,
             message: status.message,
+        }
+    }
+}
+
+impl From<types::v2::WorkloadUpdateConfigRequest> for crate::types::WorkloadUpdateConfigRequest {
+    fn from(req: types::v2::WorkloadUpdateConfigRequest) -> Self {
+        crate::types::WorkloadUpdateConfigRequest {
+            workload_id: req.workload_id,
+            environment: req.environment,
+        }
+    }
+}
+
+impl From<crate::types::WorkloadUpdateConfigResponse> for types::v2::WorkloadUpdateConfigResponse {
+    fn from(resp: crate::types::WorkloadUpdateConfigResponse) -> Self {
+        types::v2::WorkloadUpdateConfigResponse {
+            workload_status: Some(resp.workload_status.into()),
         }
     }
 }

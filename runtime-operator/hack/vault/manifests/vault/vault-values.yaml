@@ -1,0 +1,13 @@
+server:
+  dev:
+    enabled: true
+    devRootToken: "root"
+  service:
+    type: NodePort
+    nodePort: 30820
+  dataStorage:
+    enabled: false
+injector:
+  enabled: false
+ui:
+  enabled: true
