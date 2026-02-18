@@ -113,11 +113,10 @@ impl BettySmtp {
 
     fn cleanup_stale_transports(&self) {
         let now = Self::get_timestamp();
-        self.transport_pool.retain(|key, transport| {
+        self.transport_pool.retain(|_key, transport| {
             let stale = now.saturating_sub(transport.last_used) > TRANSPORT_TTL_SECS;
             if stale {
                 tracing::info!(
-                    connection_key = key,
                     last_used_secs_ago = now.saturating_sub(transport.last_used),
                     "Removing stale SMTP transport from pool"
                 );
@@ -134,7 +133,6 @@ impl BettySmtp {
         if let Some(mut entry) = self.transport_pool.get_mut(&connection_key) {
             entry.last_used = Self::get_timestamp();
             tracing::debug!(
-                connection_key = connection_key,
                 host = credentials.host,
                 port = credentials.port,
                 "Reusing existing SMTP transport from pool"
@@ -150,7 +148,6 @@ impl BettySmtp {
             .map_err(|e| anyhow::anyhow!("Failed to connect to SMTP server: {e}"))?;
 
         tracing::info!(
-            connection_key = connection_key,
             host = credentials.host,
             port = credentials.port,
             "Creating new SMTP transport"
@@ -248,7 +245,6 @@ impl Host for Ctx {
 
         tracing::debug!(
             workload_id = self.workload_id.to_string(),
-            connection_key = connection_key,
             host = credentials.host,
             port = credentials.port,
             "SMTP client connected (using shared transport)"
@@ -363,7 +359,6 @@ impl Host for Ctx {
 
         tracing::info!(
             workload_id = %self.workload_id,
-            connection_key = %connection_key,
             "Sending email via shared SMTP transport"
         );
 
@@ -420,14 +415,12 @@ impl Host for Ctx {
         if plugin.transport_pool.remove(&connection_key).is_some() {
             tracing::debug!(
                 workload_id = self.workload_id.to_string(),
-                connection_key = connection_key,
                 "SMTP transport disconnected and removed from pool"
             );
             Ok(Ok(()))
         } else {
             tracing::warn!(
                 workload_id = self.workload_id.to_string(),
-                connection_key = connection_key,
                 "SMTP transport not found in pool (may have already been disconnected)"
             );
             Ok(Ok(()))
