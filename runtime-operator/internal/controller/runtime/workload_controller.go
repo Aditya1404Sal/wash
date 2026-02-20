@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -371,6 +372,19 @@ func (r *WorkloadReconciler) reconcileSync(ctx context.Context, workload *runtim
 
 	resp, err := client.Status(ctx, req)
 	if err != nil {
+		// If the host has lost the workload (e.g. host restarted), reset placement so
+		// the workload is re-scheduled and re-started from scratch.
+		if strings.Contains(err.Error(), "not found") {
+			logger := ctrl.LoggerFrom(ctx)
+			logger.Info("workload lost on host, resetting placement for re-scheduling",
+				"workloadID", workload.Status.WorkloadID,
+				"hostID", workload.Status.HostID,
+			)
+			workload.Status.WorkloadID = ""
+			workload.Status.HostID = ""
+			workload.Status.ConfigHash = ""
+			condition.ForceStatusUpdate(ctx)
+		}
 		return err
 	}
 	if resp.WorkloadStatus.WorkloadState == runtimev2.WorkloadState_WORKLOAD_STATE_RUNNING ||
