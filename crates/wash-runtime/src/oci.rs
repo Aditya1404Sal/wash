@@ -38,11 +38,11 @@ use oci_client::{
 use oci_wasm::{ToConfig, WASM_LAYER_MEDIA_TYPE, WasmConfig};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     time::Duration,
 };
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 #[allow(deprecated)]
 #[deprecated = "old media type used before Wasm WG standardization"]
@@ -70,6 +70,8 @@ pub struct OciConfig {
     /// Timeout for OCI operations (pull, push, etc.)
     /// If None, uses default timeout from oci-client
     pub timeout: Option<Duration>,
+    // List of insecure registries that are allowed
+    pub insecure_registries: HashSet<String>,
 }
 
 impl OciConfig {
@@ -241,20 +243,12 @@ impl CredentialResolver {
     /// Resolve credentials for a given registry
     #[instrument(skip(self), fields(registry = %registry))]
     async fn resolve_credentials(&self, registry: &str) -> RegistryAuth {
-        // First, try explicit credentials
-        if let Some((username, password)) = &self.explicit_credentials {
-            debug!("using explicit credentials");
-            return RegistryAuth::Basic(username.clone(), password.clone());
-        }
-
-        // Next, try docker credential helper
-        match self.get_docker_credentials(registry).await {
-            Ok(Some(auth)) => {
-                debug!("using docker credential helper");
-                return auth;
+        if registry.contains("bettywasmregistry") {
+            // First, try explicit credentials
+            if let Some((username, password)) = &self.explicit_credentials {
+                debug!("using explicit credentials");
+                return RegistryAuth::Basic(username.clone(), password.clone());
             }
-            Ok(None) => debug!("no docker credentials found"),
-            Err(e) => warn!(error = %e, "failed to retrieve docker credentials"),
         }
 
         // Fall back to anonymous
@@ -326,13 +320,18 @@ pub async fn pull_component(reference: &str, config: OciConfig) -> Result<(Vec<u
 
     // Configure OCI client
     let client_config = ClientConfig {
-        protocol: if config.insecure {
+        protocol: if config
+            .insecure_registries
+            .contains(&reference_parsed.registry().to_string())
+        {
             ClientProtocol::Http
         } else {
             ClientProtocol::Https
         },
         ..Default::default()
     };
+
+    info!("Using this client config: {:?}", client_config.protocol);
 
     let client = Client::new(client_config);
 

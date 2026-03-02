@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context as _, bail, ensure};
 use tokio::{sync::RwLock, task::JoinHandle, time::timeout};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use wasmtime::component::{
     Component, Instance, InstancePre, Linker, ResourceAny, ResourceType, Val, types::ComponentItem,
 };
@@ -308,7 +308,23 @@ impl WorkloadComponent {
 
     /// Pre-instantiate the component to prepare for instantiation.
     pub fn pre_instantiate(&mut self) -> anyhow::Result<InstancePre<Ctx>> {
+        debug!("START PRE INSTANTIATE");
         let component = self.metadata.component.clone();
+
+        // NOTE:
+        // Dit lijkt de gene dat mis gaat
+        // En daarin dan de typecheck, daarin loopt die over de env_component.import_types()
+        // Zoekt naar cx.definition(), dus daar lijkt het mis, want waarschijnlijkg gaat die
+        // self.map mis.
+        // DUs de map, moet erigens worden aangevuld, uitzoeken waar dat is
+        // Is dus de linker.map
+        // In `into_instance()` wordt de map aangepast
+        // Ook `insert()`
+        // Dus ook `func_wrap()` en `func_wrap_concurent()`
+        // En `func_new()` en `func_new_concurrent()`
+        // En `module()`
+        // En `resource()` en `resource_async()` en `resource_concurrent()`
+        // En `into_instance()`
         self.metadata.linker.instantiate_pre(&component)
     }
 
@@ -465,9 +481,17 @@ impl ResolvedWorkload {
         // A map from component ID to its exported interfaces
         let mut interface_map: HashMap<String, Arc<str>> = HashMap::new();
 
+        // NOTE:
+        // Volgens mij moet eerst die interface map gemaakt worden, en dan pas dat je alles
+        // probeert te linken, want anders krijg je dat het af en toe mis gaat
+        // Dat gebeurt ook gewoon
+
         // Determine available component exports to link to the rest of the workload
         for c in self.components.read().await.values() {
             let exported_instances = c.component_exports()?;
+
+            debug!("Exported instances: {:?}", exported_instances);
+
             for (name, item) in exported_instances {
                 // TODO(#11): It's probably a good idea to skip registering wasi@0.2 interfaces
                 match name.split_once('@') {
@@ -497,6 +521,8 @@ impl ResolvedWorkload {
                 }
             }
         }
+
+        debug!("Interface map: {:?}", &interface_map);
 
         self.resolve_workload_imports(&interface_map).await?;
 
@@ -604,13 +630,13 @@ impl ResolvedWorkload {
         for (import_name, import_item) in imports.into_iter() {
             match import_item {
                 ComponentItem::ComponentInstance(import_instance_ty) => {
-                    trace!(name = import_name, "processing component instance import");
+                    // info!(name = import_name, "processing component instance import");
                     let mut all_components = self.components.write().await;
                     let (plugin_component, instance_idx) = {
                         let Some(exporter_component) = interface_map.get(import_name) else {
                             // TODO: error because unsatisfied import, if there's no available
                             // export then it's an unresolvable workload
-                            trace!(
+                            error!(
                                 name = import_name,
                                 "import not found in component exports, skipping"
                             );
@@ -618,10 +644,10 @@ impl ResolvedWorkload {
                         };
                         let Some(plugin_component) = all_components.get_mut(exporter_component)
                         else {
-                            trace!(
-                                name = import_name,
-                                "exporting component not found in all components, skipping"
-                            );
+                            //      warn!(
+                            //          name = import_name,
+                            //          "exporting component not found in all components, skipping"
+                            //      );
                             continue;
                         };
                         let Some((ComponentItem::ComponentInstance(_), idx)) = plugin_component
@@ -629,12 +655,12 @@ impl ResolvedWorkload {
                             .component
                             .get_export(None, import_name)
                         else {
-                            trace!(name = import_name, "skipping non-instance import");
+                            debug!(name = import_name, "skipping non-instance import");
                             continue;
                         };
                         (plugin_component, idx)
                     };
-                    trace!(name = import_name, index = ?instance_idx, "found import at index");
+                    // info!(name = import_name, index = ?instance_idx, "found import at index");
 
                     // Preinstantiate the plugin instance so we can use it later
                     let pre = plugin_component
@@ -644,7 +670,7 @@ impl ResolvedWorkload {
                     let mut linker_instance = match linker.instance(import_name) {
                         Ok(i) => i,
                         Err(e) => {
-                            trace!(name = import_name, error = %e, "error finding instance in linker, skipping");
+                            //     warn!(name = import_name, error = %e, "error finding instance in linker, skipping");
                             continue;
                         }
                     };
@@ -661,7 +687,7 @@ impl ResolvedWorkload {
                                 {
                                     Some(res) => res,
                                     None => {
-                                        trace!(
+                                        warn!(
                                             name = import_name,
                                             fn_name = export_name,
                                             "failed to get export index, skipping"
@@ -673,19 +699,24 @@ impl ResolvedWorkload {
                                     matches!(item, ComponentItem::ComponentFunc(..)),
                                     "expected function export, found other"
                                 );
-                                trace!(
-                                    name = import_name,
-                                    fn_name = export_name,
-                                    "linking function import"
-                                );
+                                //        info!(
+                                //            name = import_name,
+                                //            fn_name = export_name,
+                                //            "linking function import"
+                                //        );
                                 let import_name: Arc<str> = import_name.into();
                                 let export_name: Arc<str> = export_name.into();
                                 let pre = pre.clone();
                                 let instance = instance.clone();
+                                // NOTE:
+                                // Hier worden ze dus toegevoegd
                                 linker_instance
                                     .func_new_async(
                                         &export_name.clone(),
                                         move |mut store, params, results| {
+                                            //                    info!(
+                                            //                        "Calling this export name: {}", export_name.clone()
+                                            //                    );
                                             // TODO(#103): some kind of store data hashing mechanism
                                             // to detect a diff store to drop the old one
                                             let import_name = import_name.clone();
@@ -693,15 +724,28 @@ impl ResolvedWorkload {
                                             let pre = pre.clone();
                                             let instance = instance.clone();
                                             Box::new(async move {
+                                                //                        info!(
+                                                //                            "Into the new box: {}", export_name.clone()
+                                                //                        );
                                                 let existing_instance = instance.read().await;
                                                 let store_id = store.data().id.clone();
+
+                                                //                        info!(
+                                                //                            "Before creating the instance: {}", export_name.clone()
+                                                //                        );
                                                 let instance = if let Some((id, instance)) =
                                                     existing_instance.clone()
                                                     && id == store_id
                                                 {
+                                                    //                            info!(
+                                                    //                                "Dropping existing instance: {}", export_name.clone()
+                                                    //                            );
                                                     drop(existing_instance);
                                                     instance
                                                 } else {
+                                                    //                            info!(
+                                                    //                                "Creating new instance and dropping existing instance: {}", export_name.clone()
+                                                    //                            );
                                                     // Likely unnecessary, but explicit drop of the read lock
                                                     let new_instance =
                                                         pre.instantiate_async(&mut store).await?;
@@ -711,15 +755,38 @@ impl ResolvedWorkload {
                                                     new_instance
                                                 };
 
+                                                //                        info!(
+                                                //                                "Starting by getting the function from the instance: {}", export_name.clone()
+                                                //                            );
+
+                                                let eng = store.engine().clone();
+                                                let comp = pre.component();
+                                                //                        info!(
+                                                //                            "Exported components: {:?}",
+                                                //                            comp.component_type().exports(&eng).collect::<Vec<_>>()
+                                                //                    );info!(
+                                                //                            "Imported components: {:?}",
+                                                //                            comp.component_type().imports(&eng).collect::<Vec<_>>()
+                                                //                    );
+
                                                 let func = instance
                                                     .get_func(&mut store, func_idx)
-                                                    .context("function not found")?;
-                                                trace!(
-                                                    name = %import_name,
-                                                    fn_name = %export_name,
-                                                    ?params,
-                                                    "lowering params"
-                                                );
+                                                    .context("function not found");
+
+                                                let func = match func {
+                                                    Ok(func) => func,
+                                                    Err(e) => {
+                                                        error!("Error in gettin func: {:?}", e);
+                                                        return Err(e);
+                                                    }
+                                                };
+
+                                                //                        info!(
+                                                //                            name = %import_name,
+                                                //                            fn_name = %export_name,
+                                                //                            ?params,
+                                                //                            "lowering params"
+                                                //                        );
                                                 let mut params_buf =
                                                     Vec::with_capacity(params.len());
                                                 for v in params {
@@ -728,19 +795,20 @@ impl ResolvedWorkload {
                                                             "failed to lower parameter",
                                                         )?);
                                                 }
-                                                trace!(
-                                                    name = %import_name,
-                                                    fn_name = %export_name,
-                                                    ?params_buf,
-                                                    "invoking dynamic export"
-                                                );
+                                                //                        info!(
+                                                //                            name = %import_name,
+                                                //                            fn_name = %export_name,
+                                                //                            ?params_buf,
+                                                //                            "invoking dynamic export"
+                                                //                        );
 
                                                 let mut results_buf =
                                                     vec![Val::Bool(false); results.len()];
 
+                                                const CALL_TIMEOUT_SECS: u64 = 10 * 60;
                                                 // Enforce a timeout on this call to prevent hanging indefinitely
                                                 const CALL_TIMEOUT: Duration =
-                                                    Duration::from_secs(30);
+                                                    Duration::from_secs(CALL_TIMEOUT_SECS);
                                                 timeout(
                                                     CALL_TIMEOUT,
                                                     func.call_async(
@@ -754,23 +822,23 @@ impl ResolvedWorkload {
                                                     "function call timed out after 30 seconds",
                                                 )?
                                                 .context("failed to call function")?;
-
-                                                trace!(
-                                                    name = %import_name,
-                                                    fn_name = %export_name,
-                                                    ?results_buf,
-                                                    "lifting results"
-                                                );
+                                                //
+                                                //                                                info!(
+                                                //                                                    name = %import_name,
+                                                //                                                    fn_name = %export_name,
+                                                //                                                    ?results_buf,
+                                                //                                                    "lifting results"
+                                                //                                                );
                                                 for (i, v) in results_buf.into_iter().enumerate() {
                                                     results[i] = lift(&mut store, v)
                                                         .context("failed to lift result")?;
                                                 }
-                                                trace!(
-                                                    name = %import_name,
-                                                    fn_name = %export_name,
-                                                    ?results,
-                                                    "invoked dynamic export"
-                                                );
+                                                //                                                info!(
+                                                //                                                    name = %import_name,
+                                                //                                                    fn_name = %export_name,
+                                                //                                                    ?results,
+                                                //                                                    "invoked dynamic export"
+                                                //                                                );
 
                                                 func.post_return_async(&mut store)
                                                     .await
@@ -789,20 +857,20 @@ impl ResolvedWorkload {
                                 {
                                     Some(res) => res,
                                     None => {
-                                        trace!(
-                                            name = import_name,
-                                            resource = export_name,
-                                            "failed to get resource index, skipping"
-                                        );
+                                        //                                        warn!(
+                                        //                                            name = import_name,
+                                        //                                            resource = export_name,
+                                        //                                            "failed to get resource index, skipping"
+                                        //                                        );
                                         continue;
                                     }
                                 };
                                 let ComponentItem::Resource(_) = item else {
-                                    trace!(
-                                        name = import_name,
-                                        resource = export_name,
-                                        "expected resource export, found non-resource, skipping"
-                                    );
+                                    //                                    warn!(
+                                    //                                        name = import_name,
+                                    //                                        resource = export_name,
+                                    //                                        "expected resource export, found non-resource, skipping"
+                                    //                                    );
                                     continue;
                                 };
 
@@ -814,15 +882,15 @@ impl ResolvedWorkload {
                                     || export_name == "tcp-socket"
                                     || export_name == "incoming-value-async-body"
                                 {
-                                    trace!(
-                                        name = import_name,
-                                        resource = export_name,
-                                        "skipping stream link as it is a host resource type"
-                                    );
+                                    //                                    warn!(
+                                    //                                        name = import_name,
+                                    //                                        resource = export_name,
+                                    //                                        "skipping stream link as it is a host resource type"
+                                    //                                    );
                                     continue;
                                 }
 
-                                trace!(name = import_name, resource = export_name, ty = ?resource_ty, "linking resource import");
+                                //                               info!(name = import_name, resource = export_name, ty = ?resource_ty, "linking resource import");
 
                                 linker_instance
                                         .resource(export_name, ResourceType::host::<ResourceAny>(), |_, _| Ok(()))
@@ -832,26 +900,26 @@ impl ResolvedWorkload {
                                             )
                                         })
                                         .unwrap_or_else(|e| {
-                                            trace!(name = import_name, resource = export_name, error = %e, "error defining resource import, skipping");
+                                            warn!(name = import_name, resource = export_name, error = %e, "error defining resource import, skipping");
                                         });
                             }
                             _ => {
-                                trace!(
-                                    name = import_name,
-                                    fn_name = export_name,
-                                    "skipping non-function non-resource import"
-                                );
+                                //                              warn!(
+                                //                                  name = import_name,
+                                //                                  fn_name = export_name,
+                                //                                  "skipping non-function non-resource import"
+                                //                              );
                                 continue;
                             }
                         }
                     }
                 }
                 ComponentItem::Resource(resource_ty) => {
-                    trace!(
-                        name = import_name,
-                        ty = ?resource_ty,
-                        "component import is a resource, which is not supported in this context. skipping."
-                    );
+                    //                  warn!(
+                    //                      name = import_name,
+                    //                      ty = ?resource_ty,
+                    //                      "component import is a resource, which is not supported in this context. skipping."
+                    //                  );
                 }
                 _ => continue,
             }

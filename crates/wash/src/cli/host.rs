@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use clap::Args;
@@ -86,7 +86,8 @@ impl CliCommand for HostCommand {
                 wash_runtime::washlet::plugins::wasi_keyvalue::WasiKeyvalue::new(
                     data_nats_client.clone(),
                 ),
-            ))?;
+            ))?
+            .with_grpc(HashMap::new());
 
         if let Some(host_name) = &self.host_name {
             cluster_host_builder = cluster_host_builder.with_host_name(host_name);

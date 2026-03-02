@@ -30,8 +30,13 @@ use crate::engine::workload::ResolvedWorkload;
 use crate::wit::WitInterface;
 use anyhow::{Context, ensure};
 use hyper::server::conn::http1;
+use hyper_util::rt::TokioIo;
+use rustls::{ServerConfig, pki_types::CertificateDer};
+use rustls_pemfile::{certs, private_key};
 use tokio::net::TcpListener;
+use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 use wasmtime::Store;
 use wasmtime::component::InstancePre;
@@ -39,13 +44,7 @@ use wasmtime_wasi_http::{
     WasiHttpView,
     bindings::{ProxyPre, http::types::Scheme},
     body::HyperOutgoingBody,
-    io::TokioIo,
 };
-
-use rustls::{ServerConfig, pki_types::CertificateDer};
-use rustls_pemfile::{certs, private_key};
-use tokio::sync::{RwLock, mpsc};
-use tokio_rustls::TlsAcceptor;
 
 /// Trait defining the routing behavior for HTTP requests
 /// Allows for custom routing logic based on workload IDs and requests
@@ -94,6 +93,7 @@ impl Router for DynamicRouter {
         resolved_handle: &ResolvedWorkload,
         _component_id: &str,
     ) -> anyhow::Result<()> {
+        info!("In workload resolved");
         let incoming_handler_interface = WitInterface::from("wasi:http/incoming-handler");
         let Some(http_iface) = resolved_handle
             .host_interfaces()
@@ -109,6 +109,13 @@ impl Router for DynamicRouter {
             .cloned()
             .context("No host header found")?;
 
+        info!("ADDED THIS TO HOST_TO_WORKLOAD");
+        info!(
+            "HOST HEADER: {} and ID: {}",
+            host_header,
+            resolved_handle.id().to_string()
+        );
+
         {
             let mut lock = self.workload_to_host.write().await;
             lock.insert(resolved_handle.id().to_string(), host_header.clone());
@@ -119,6 +126,7 @@ impl Router for DynamicRouter {
             let entry = lock.entry(host_header.clone()).or_insert_with(HashSet::new);
             entry.insert(resolved_handle.id().to_string());
         }
+        info!("Out workload resolved");
 
         Ok(())
     }
@@ -151,14 +159,20 @@ impl Router for DynamicRouter {
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
     ) -> anyhow::Result<String> {
+        info!("In route incoming request");
         tokio::task::block_in_place(move || {
             let lock = self.host_to_workload.try_read()?;
+
+            info!("Out route incoming request");
+            info!("Host to workload map, {:?}", lock);
+
             let workload_host = req
                 .headers()
                 .get(hyper::header::HOST)
                 .and_then(|h| h.to_str().ok())
                 .context("no Host header in request")?;
             let Some(workload_set) = lock.get(workload_host) else {
+                info!("no workload bound to host header: {}", workload_host);
                 anyhow::bail!("no workload bound to host header: {}", workload_host);
             };
 
@@ -167,6 +181,9 @@ impl Router for DynamicRouter {
                 .next()
                 .context("no workload IDs found for host header")?;
 
+            info!("Go to workload_id: {}", workload_id.clone());
+
+            info!("Out route incoming request");
             Ok(workload_id.clone())
         })
     }
@@ -459,6 +476,27 @@ impl<T: Router> HostHandler for HttpServer<T> {
 
         // NOTE(lxf): Bring wasi-http code if needed
         // Separate HTTP / GRPC handling
+        let is_grpc = request
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.starts_with("application/grpc"))
+            .unwrap_or(false);
+
+        // Route to appropriate client plugin
+        if is_grpc {
+            #[cfg(feature = "grpc")]
+            {
+                return crate::grpc::send_request(request, config);
+            }
+            #[cfg(not(feature = "grpc"))]
+            {
+                return Err(wasmtime_wasi_http::HttpError::trap(anyhow::anyhow!(
+                    "gRPC requests are not supported. Please enable the 'grpc' feature."
+                )));
+            }
+        }
+
         Ok(wasmtime_wasi_http::types::default_send_request(
             request, config,
         ))
@@ -552,7 +590,7 @@ async fn handle_http_request<T: Router>(
             .expect("failed to build 400 response"));
     };
 
-    debug!(
+    info!(
         method = %method,
         uri = %uri,
         host = %workload_id,
@@ -564,7 +602,7 @@ async fn handle_http_request<T: Router>(
     // Look up workload handle for this host, with wildcard fallback
     let workload_handle = {
         let handles = workload_handles.read().await;
-        debug!(host = %workload_id, "looking up workload handle for host header");
+        info!(host = %workload_id, "looking up workload handle for host header");
         handles.get(&workload_id).cloned()
     };
 
@@ -577,7 +615,6 @@ async fn handle_http_request<T: Router>(
                     hyper::Response::builder()
                         .status(500)
                         .body(HyperOutgoingBody::default())
-                        // TODO: Add in the actual error message in the response body
                         // .body(HyperOutgoingBody::new(e.to_string()))
                         .expect("failed to build 500 response")
                 }
@@ -591,7 +628,6 @@ async fn handle_http_request<T: Router>(
                 .expect("failed to build 404 response")
         }
     };
-
     Ok(response)
 }
 

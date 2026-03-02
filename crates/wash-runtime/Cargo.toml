@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "washlet","wasmcloud-smtp"]
+grpc = ["dep:once_cell"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 washlet = ["oci"]
 wasi-config = []
@@ -43,7 +44,7 @@ uuid = { workspace = true, features = ["v4"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "net", "macros"] }
 tracing = { workspace = true }
-wasmtime = { workspace = true, features = ["component-model", "cranelift", "pooling-allocator"] }
+wasmtime = { workspace = true, features = ["component-model", "winch", "pooling-allocator"] }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-io = { workspace = true }
 wasmtime-wasi-http = { workspace = true, features = ["default-send-request"] }
@@ -79,6 +80,11 @@ oci-client = { workspace = true, optional = true, features = ["rustls-tls", "rus
 oci-wasm = { workspace = true, optional = true, features = ["rustls-tls"] }
 sha2 = { workspace = true, optional = true }
 wit-component = { workspace = true, optional = true }
+hyper-util = { version = "0.1.18", features = ["client-legacy", "http1", "http2", "tokio"] }
+http-body-util = "0.1.3"
+once_cell = { version = "1.19.0", optional = true }
+tower-service = "0.3.3"
+webpki-roots = "0.26"
 
 [build-dependencies]
 anyhow = { workspace = true, default-features = true }

@@ -1,3 +1,8 @@
+#[cfg(feature = "grpc")]
+use std::collections::HashMap;
+
+use std::collections::HashSet;
+use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +14,7 @@ use futures::StreamExt as _;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::resource::{Resource, ResourceBuilder};
 use opentelemetry_semantic_conventions::resource;
+use std::time::SystemTime;
 use sysinfo::System;
 use tokio::sync::oneshot;
 use tracing::{debug, info};
@@ -61,6 +67,12 @@ impl ClusterHostBuilder {
 
     pub fn with_nats_client(mut self, nats_client: Arc<async_nats::Client>) -> Self {
         self.nats_client = Some(nats_client);
+        self
+    }
+
+    #[cfg(feature = "grpc")]
+    pub fn with_grpc(mut self, config: HashMap<String, String>) -> Self {
+        self.host_builder = self.host_builder.with_grpc(config);
         self
     }
 
@@ -261,14 +273,25 @@ async fn handle_command(
 }
 
 /// Convert ImagePullSecret from protobuf to OciConfig
-fn image_pull_secret_to_oci_config(
+pub fn image_pull_secret_to_oci_config(
     config: &HostConfig,
     pull_secret: &Option<types::v2::ImagePullSecret>,
 ) -> oci::OciConfig {
     let mut oci_config = match &pull_secret {
         Some(creds) => oci::OciConfig::new_with_credentials(&creds.username, &creds.password),
-        None => OciConfig::default(),
+        None => {
+            let registry_username = env::var("REGISTRY_USERNAME");
+            let registry_password = env::var("REGISTRY_PASSWORD");
+
+            match (registry_username, registry_password) {
+                (Ok(username), Ok(password)) => {
+                    oci::OciConfig::new_with_credentials(&username, &password)
+                }
+                _ => OciConfig::default(),
+            }
+        }
     };
+
     oci_config.insecure = config.allow_oci_insecure;
     oci_config.timeout = config.oci_pull_timeout;
 
@@ -286,7 +309,10 @@ async fn workload_start(
     req: types::v2::WorkloadStartRequest,
     config: &HostConfig,
 ) -> anyhow::Result<types::v2::WorkloadStartResponse> {
+    let start_time = SystemTime::now();
+    info!("Start workload time: {:?}", start_time);
     let Some(types::v2::Workload {
+        workload_id,
         namespace,
         name,
         annotations,
@@ -301,10 +327,28 @@ async fn workload_start(
     let (components, host_interfaces) = if let Some(wit_world) = wit_world {
         let mut pulled_components = Vec::with_capacity(wit_world.components.len());
         for component in &wit_world.components {
+            let insecure_registries = env::var("INSECURE_REGISTRIES")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect::<HashSet<_>>();
+
+            info!("insecure registries {:?}", insecure_registries,);
+
             let oci_config = image_pull_secret_to_oci_config(config, &component.image_pull_secret);
+            let oci_config = OciConfig {
+                insecure_registries,
+                ..oci_config
+            };
             let bytes = match oci::pull_component(&component.image, oci_config).await {
-                Ok(bytes) => bytes,
+                Ok(bytes) => {
+                    info!("success pull of image: {}", component.image);
+                    bytes
+                }
                 Err(e) => {
+                    info!("failed to pull component image {}: {}", component.image, e);
                     return Ok(types::v2::WorkloadStartResponse {
                         workload_status: Some(types::v2::WorkloadStatus {
                             workload_id: "".into(),
@@ -339,9 +383,26 @@ async fn workload_start(
     } else {
         (vec![], vec![])
     };
+    info!(
+        "Workload pulled images in: {:?}s",
+        start_time.elapsed().expect("error").as_secs_f64()
+    );
 
     let service = if let Some(service) = service {
+        let insecure_registries = env::var("INSECURE_REGISTRIES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect::<HashSet<_>>();
+
         let oci_config = image_pull_secret_to_oci_config(config, &service.image_pull_secret);
+        let oci_config = OciConfig {
+            insecure_registries,
+            ..oci_config
+        };
+
         let bytes = match oci::pull_component(&service.image, oci_config).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -367,10 +428,15 @@ async fn workload_start(
         None
     };
 
+    info!(
+        "Workload pulled service in: {:?}s",
+        start_time.elapsed().expect("error").as_secs_f64()
+    );
+
     let volumes = volumes.into_iter().map(Into::into).collect();
 
     let request = crate::types::WorkloadStartRequest {
-        workload_id: uuid::Uuid::new_v4().to_string(),
+        workload_id: workload_id,
         workload: crate::types::Workload {
             namespace,
             name,
@@ -388,7 +454,23 @@ async fn workload_start(
         name=?request.workload.name,
         "Starting workload");
 
-    Ok(host.workload_start(request).await?.into())
+    let resp = host.workload_start(request).await;
+
+    info!(
+        "Workload started in: {:?}s",
+        start_time.elapsed().expect("error").as_secs_f64()
+    );
+
+    match resp {
+        Ok(resp) => Ok(resp.into()),
+        Err(e) => Ok(types::v2::WorkloadStartResponse {
+            workload_status: Some(types::v2::WorkloadStatus {
+                workload_id: "".into(),
+                workload_state: types::v2::WorkloadState::Error.into(),
+                message: format!("failed to start workload: {}", e),
+            }),
+        }),
+    }
 }
 
 async fn workload_stop(

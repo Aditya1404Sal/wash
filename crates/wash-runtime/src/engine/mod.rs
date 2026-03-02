@@ -40,6 +40,7 @@
 //! ```
 
 use anyhow::{Context, bail};
+use tracing::info;
 use wasmtime::PoolingAllocationConfig;
 use wasmtime::component::{Component, Linker};
 
@@ -47,6 +48,7 @@ use crate::engine::ctx::Ctx;
 use crate::engine::workload::{UnresolvedWorkload, WorkloadComponent, WorkloadService};
 use crate::types::{EmptyDirVolume, HostPathVolume, VolumeType, Workload};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 pub mod ctx;
 mod value;
@@ -252,22 +254,40 @@ impl Engine {
         component: crate::types::Component,
         validated_volumes: &std::collections::HashMap<String, PathBuf>,
     ) -> anyhow::Result<WorkloadComponent> {
+        let start_time = SystemTime::now();
+        info!("Start initialize workload component time: {:?}", start_time);
         // Create a wasmtime component from the bytes
         let wasmtime_component = Component::new(&self.inner, component.bytes)
             .context("failed to create component from bytes")?;
 
+        info!(
+            "Created component: {:?}",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
         // Create a linker for this component
         let mut linker: Linker<Ctx> = Linker::new(&self.inner);
+        info!(
+            "Created linker: {:?}",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         // Add WASI@0.2 interfaces to the linker
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .context("failed to add WASI to linker")?;
+        info!(
+            "Add wasi p2 to linker: {:?}",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         // Add HTTP interfaces to the linker
         if uses_wasi_http(&wasmtime_component) {
             wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
                 .context("failed to add wasi:http/types to linker")?;
         }
+        info!(
+            "Add wasi http linker: {:?}",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         // Build volume mounts for this component by looking up validated volumes
         let mut component_volume_mounts = Vec::new();
@@ -281,6 +301,10 @@ impl Engine {
                 );
             }
         }
+        info!(
+            "Out of initialize workload component: {:?}",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         // Create the WorkloadComponent with volume mounts
         Ok(WorkloadComponent::new(

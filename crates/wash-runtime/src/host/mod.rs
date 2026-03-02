@@ -43,12 +43,12 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
 use names::{Generator, Name};
 use tokio::sync::RwLock;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::engine::Engine;
 use crate::engine::workload::ResolvedWorkload;
@@ -468,11 +468,19 @@ impl HostApi for Host {
         &self,
         request: WorkloadStartRequest,
     ) -> anyhow::Result<WorkloadStartResponse> {
+        let start_time = SystemTime::now();
+        info!("Start inner workload time: {:?}", start_time);
+
         // Store the workload with initial state
         self.workloads
             .write()
             .await
             .insert(request.workload_id.clone(), HostWorkload::Starting);
+
+        info!(
+            "Written workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         let service_present = request.workload.service.is_some();
 
@@ -481,9 +489,19 @@ impl HostApi for Host {
             .engine
             .initialize_workload(&request.workload_id, request.workload)?;
 
+        info!(
+            "Initialized workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
+
         let mut resolved_workload = unresolved_workload
             .resolve(Some(&self.plugins), self.http_handler.clone())
             .await?;
+
+        info!(
+            "Resolved workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         // If the service didn't run and we had one, warn
         if resolved_workload.execute_service().await? != service_present {
@@ -493,6 +511,11 @@ impl HostApi for Host {
             );
         }
 
+        info!(
+            "Executed service workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
+
         // Update the workload state to `Running`
         self.workloads
             .write()
@@ -501,6 +524,11 @@ impl HostApi for Host {
             .and_modify(|workload| {
                 *workload = HostWorkload::Running(Box::new(resolved_workload));
             });
+
+        info!(
+            "Finished inner start workload in: {:?}s",
+            start_time.elapsed().expect("error").as_secs_f64()
+        );
 
         Ok(WorkloadStartResponse {
             workload_status: WorkloadStatus {
@@ -541,6 +569,10 @@ impl HostApi for Host {
 
         let (workload_state, message) = if has_workload {
             // Update state to stopping
+
+            // NOTE:
+            // resolved_workload heeft alleen een workload, wanneer die running is
+            // want anders heb je een unresolved workload
             let resolved_workload = {
                 let mut workloads = self.workloads.write().await;
                 trace!(
@@ -582,7 +614,15 @@ impl HostApi for Host {
 
             // Remove the workload from the active workloads map
             // This will drop the workload and clean up wasmtime resources
-            self.workloads.write().await.remove(&request.workload_id);
+            // NOTE:
+            // Wat als de workload nog niet geresolved is, dus workload_start is nog
+            // in volle gang, kan deze write er dan al bij? En dan dus die workload stoppen of
+            // gaat die dan gewoon door?
+            //
+            // Volgens mij zou dit altijd goed moeten gaan, behalve wanneer dit wordt aangeroepen
+            // wanneer de start nog niet is geweest
+            let hallo = self.workloads.write().await.remove(&request.workload_id);
+            drop(hallo);
 
             debug!(
                 workload_id = request.workload_id,
@@ -594,6 +634,10 @@ impl HostApi for Host {
                 "Workload stopped successfully".to_string(),
             )
         } else {
+            info!(
+                "Tried to stop non existing workload: {}",
+                request.workload_id
+            );
             (WorkloadState::Unspecified, "Workload not found".to_string())
         };
 
@@ -647,6 +691,8 @@ pub struct HostBuilder {
     labels: HashMap<String, String>,
     http_handler: Option<Arc<dyn crate::host::http::HostHandler>>,
     config: Option<HostConfig>,
+    #[cfg(feature = "grpc")]
+    grpc_config: Option<HashMap<String, String>>,
 }
 
 impl Default for HostBuilder {
@@ -660,6 +706,8 @@ impl Default for HostBuilder {
             labels: Default::default(),
             http_handler: Default::default(),
             config: Default::default(),
+            #[cfg(feature = "grpc")]
+            grpc_config: Default::default(),
         }
     }
 }
@@ -684,6 +732,12 @@ impl HostBuilder {
         self
     }
 
+    #[cfg(feature = "grpc")]
+    pub fn with_grpc(mut self, config: HashMap<String, String>) -> Self {
+        self.grpc_config = Some(config);
+        self
+    }
+
     pub fn with_plugin<T: HostPlugin>(mut self, plugin: Arc<T>) -> anyhow::Result<Self> {
         let plugin_id = plugin.id();
 
@@ -695,7 +749,6 @@ impl HostBuilder {
         self.plugins.insert(plugin_id, plugin);
         Ok(self)
     }
-
     /// Sets the hostname for this host.
     ///
     /// # Arguments
@@ -755,10 +808,17 @@ impl HostBuilder {
     /// # Errors
     /// Returns an error if the default engine cannot be created (when no engine is provided).
     pub fn build(self) -> anyhow::Result<Host> {
+        #[cfg(feature = "grpc")]
+        if let Some(config) = self.grpc_config {
+            crate::grpc::init_grpc(&config)?;
+        }
+
         let engine = if let Some(engine) = self.engine {
             engine
         } else {
-            Engine::builder().build()?
+            let mut config = wasmtime::Config::default();
+            config.strategy(wasmtime::Strategy::Winch);
+            Engine::builder().with_config(config).build()?
         };
 
         // Get hostname from system if not provided
