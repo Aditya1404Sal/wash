@@ -13,7 +13,6 @@ FROM chef AS builder
 
 RUN apk --no-cache add protoc protobuf protobuf-dev
 
-
 COPY --from=planner /src/recipe.json recipe.json
 # Notice that we are specifying the --target flag!
 RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json

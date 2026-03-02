@@ -49,7 +49,9 @@ cd wash
 cargo install --path .
 ```
 
-## Quick Start
+## Quickstart
+
+Note: This quickstart requires the [Rust toolchain](https://www.rust-lang.org/tools/install) and the `wasm32-wasip2` target for Rust: `rustup target add wasm32-wasip2`
 
 1. **Check your environment:**
 
@@ -60,19 +62,19 @@ cargo install --path .
 2. **Create a new component:**
 
    ```bash
-   wash new
+   wash new https://github.com/wasmCloud/wash.git --subfolder examples/http-hello-world
    ```
 
 3. **Build your component:**
 
    ```bash
-   wash build ./http-hello-world
+   wash -C ./http-hello-world build
    ```
 
 4. **Start a development loop**
 
    ```bash
-   wash dev ./http-hello-world
+   wash -C ./http-hello-world dev
    ```
 
 5. **Keep wash updated:**

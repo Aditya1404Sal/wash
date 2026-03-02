@@ -12,7 +12,7 @@ categories = ["wasm"]
 path = "src/lib.rs"
 
 [features]
-default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "washlet"]
+default = ["wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "washlet","wasmcloud-smtp"]
 grpc = ["dep:once_cell"]
 oci = ["dep:oci-client", "dep:oci-wasm", "dep:docker_credential", "dep:sha2", "dep:wit-component"]
 washlet = ["oci"]
@@ -20,7 +20,9 @@ wasi-config = []
 wasi-logging = []
 wasi-blobstore = []
 wasi-keyvalue = []
+wasmcloud-smtp = ["dep:lettre", "dep:html2text"]
 wasi-webgpu = ["dep:wasi-webgpu-wasmtime", "dep:wasi-graphics-context-wasmtime"]
+tls = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -28,9 +30,13 @@ async-nats = { workspace = true, features = ["aws-lc-rs"] }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+dashmap = { version = "6.0"}
 futures = { workspace = true }
 hostname = { workspace = true }
 hyper = { workspace = true, features = ["server", "http1"] }
+html2text = { version = "0.14", default-features = false, optional = true }
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder", "hostname", "pool"], optional = true }
+reqwest = { workspace = true }
 names = { workspace = true }
 semver = { workspace = true }
 sysinfo = { workspace = true }
@@ -90,3 +96,4 @@ tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 gag = "1.0"
+testcontainers = "0.23"
