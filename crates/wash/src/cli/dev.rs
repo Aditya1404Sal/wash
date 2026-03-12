@@ -632,6 +632,7 @@ fn create_workload(
         },
         pool_size: -1,
         max_invocations: -1,
+        interface_config: HashMap::new(),
     });
     components.extend(dev_register_components.into_iter().map(|bytes| Component {
         bytes,
@@ -644,6 +645,7 @@ fn create_workload(
         //     }],
         //     ..Default::default()
         // },
+        interface_config: HashMap::new(),
         ..Default::default()
     }));
     Workload {

@@ -61,6 +61,10 @@ pub struct Component {
     pub local_resources: LocalResources,
     pub pool_size: i32,
     pub max_invocations: i32,
+    /// Per-component configuration keyed by WIT interface identifier.
+    /// Example: `{"wasi:http/incoming-handler": {"path": "/user/{id}"}}`
+    /// This is the preferred way to provide per-component interface overrides.
+    pub interface_config: HashMap<String, HashMap<String, String>>,
 }
 
 /// Resource limits and configuration for a component or service.

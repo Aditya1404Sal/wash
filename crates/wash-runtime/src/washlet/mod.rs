@@ -89,6 +89,11 @@ impl ClusterHostBuilder {
         self
     }
 
+    pub fn with_label(mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.host_builder = self.host_builder.with_label(key, value);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<ClusterHost> {
         let Some(nats_client) = self.nats_client else {
             anyhow::bail!("nats_client is required");
@@ -370,6 +375,11 @@ async fn workload_start(
                     .unwrap_or_default(),
                 pool_size: component.pool_size,
                 max_invocations: component.max_invocations,
+                interface_config: component
+                    .interface_config
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.config.clone()))
+                    .collect(),
             })
         }
         (
@@ -436,7 +446,7 @@ async fn workload_start(
     let volumes = volumes.into_iter().map(Into::into).collect();
 
     let request = crate::types::WorkloadStartRequest {
-        workload_id: workload_id,
+        workload_id,
         workload: crate::types::Workload {
             namespace,
             name,

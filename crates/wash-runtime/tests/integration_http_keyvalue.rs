@@ -95,6 +95,7 @@ async fn test_http_keyvalue_counter_integration() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 100,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![
                 WitInterface {
@@ -364,6 +365,7 @@ async fn test_keyvalue_counter_concurrent_access() -> Result<()> {
                 },
                 pool_size: 3, // Higher pool size for concurrent testing
                 max_invocations: 200,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![
                 WitInterface {
@@ -544,6 +546,7 @@ async fn test_keyvalue_error_handling() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 50,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![
                 WitInterface {

@@ -566,6 +566,7 @@ impl CliContext {
             service: None,
             components: vec![Component {
                 bytes: plugin_bytes.into(),
+                interface_config: HashMap::new(),
                 ..Default::default()
             }],
             host_interfaces: vec![

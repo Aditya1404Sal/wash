@@ -130,6 +130,7 @@ impl PluginManager {
                     },
                     pool_size: 1,
                     max_invocations: 1,
+                    interface_config: HashMap::new(),
                 }],
                 host_interfaces: vec![
                     WitInterface::from("wasmcloud:wash/types@0.0.2"),

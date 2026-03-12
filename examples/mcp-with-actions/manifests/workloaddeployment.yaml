@@ -1,0 +1,38 @@
+# Example: MCP server + Actions in a single workload
+#
+# This demonstrates the primary use case for per-component path routing:
+# an MCP server and an Actions component coexisting in one workload,
+# each handling HTTP at different paths.
+#
+# - "mcp-server" handles /mcp/{server-id} — MCP protocol endpoint
+# - "actions" handles /actions — GitHub-style webhook/action handler
+#
+# Per-component interfaceConfig allows each component to declare its own
+# path-based routing, so they can share a workload and be co-located
+# on the same host.
+apiVersion: runtime.wasmcloud.dev/v1alpha1
+kind: WorkloadDeployment
+metadata:
+  name: mcp-with-actions
+spec:
+  replicas: 1
+  template:
+    spec:
+      hostSelector:
+        hostgroup: default
+      components:
+        - name: mcp-server
+          image: ghcr.io/betty-blocks/examples/betty-mcp:0.1.0
+          interfaceConfig:
+            "wasi:http/incoming-handler":
+              path: "/mcp/{server-id}"
+        - name: actions
+          image: ghcr.io/betty-blocks/examples/mock-actions:0.1.0
+          interfaceConfig:
+            "wasi:http/incoming-handler":
+              path: "/actions"
+      hostInterfaces:
+        - namespace: wasi
+          package: http
+          interfaces:
+            - incoming-handler

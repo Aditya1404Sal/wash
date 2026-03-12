@@ -42,7 +42,7 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 #[allow(deprecated)]
 #[deprecated = "old media type used before Wasm WG standardization"]
@@ -257,6 +257,7 @@ impl CredentialResolver {
     }
 
     /// Attempt to retrieve credentials from docker credential helper
+    #[allow(dead_code)]
     async fn get_docker_credentials(&self, registry: &str) -> Result<Option<RegistryAuth>> {
         match get_credential(registry) {
             Ok(DockerCredential::UsernamePassword(user, pass)) => {
@@ -322,7 +323,7 @@ pub async fn pull_component(reference: &str, config: OciConfig) -> Result<(Vec<u
     let client_config = ClientConfig {
         protocol: if config
             .insecure_registries
-            .contains(&reference_parsed.registry().to_string())
+            .contains(reference_parsed.registry())
         {
             ClientProtocol::Http
         } else {

@@ -3,7 +3,7 @@ use std::{collections::HashSet, env};
 use wash_runtime::{
     host::HostConfig,
     oci::{self, OciConfig},
-    washlet::{image_pull_secret_to_oci_config, types},
+    washlet::image_pull_secret_to_oci_config,
 };
 
 #[tokio::main]
@@ -27,7 +27,7 @@ async fn main() {
         ..oci_config
     };
 
-    let _bytes = match oci::pull_component(&image, oci_config).await {
+    match oci::pull_component(image, oci_config).await {
         Ok(_bytes) => println!("Successfully pulled"),
         Err(e) => {
             eprintln!("failed to pull component image {}: {}", image, e);
@@ -43,7 +43,7 @@ async fn main() {
         ..oci_config
     };
 
-    let _bytes = match oci::pull_component(&image, oci_config).await {
+    match oci::pull_component(image, oci_config).await {
         Ok(_bytes) => println!("Successfully pulled"),
         Err(e) => {
             eprintln!("failed to pull component image {}: {}", image, e);
@@ -60,7 +60,7 @@ async fn main() {
         ..oci_config
     };
 
-    let _bytes = match oci::pull_component(&image, oci_config).await {
+    match oci::pull_component(image, oci_config).await {
         Ok(_bytes) => println!("Successfully pulled"),
         Err(e) => {
             eprintln!("failed to pull component image {}: {}", image, e);
@@ -77,7 +77,7 @@ async fn main() {
         ..oci_config
     };
 
-    let _bytes = match oci::pull_component(&image, oci_config).await {
+    match oci::pull_component(image, oci_config).await {
         Ok(_bytes) => println!("Successfully pulled"),
         Err(e) => {
             eprintln!("failed to pull component image {}: {}", image, e);

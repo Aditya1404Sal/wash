@@ -1,0 +1,24 @@
+# Example: Workload-level path routing
+#
+# This workload has a single component that handles /admin requests.
+# The path config is on the workload-level hostInterfaces.
+apiVersion: runtime.wasmcloud.dev/v1alpha1
+kind: WorkloadDeployment
+metadata:
+  name: admin-workload
+spec:
+  replicas: 1
+  template:
+    spec:
+      hostSelector:
+        hostgroup: default
+      components:
+        - name: admin
+          image: ghcr.io/wasmcloud/examples/admin:0.1.0
+      hostInterfaces:
+        - namespace: wasi
+          package: http
+          interfaces:
+            - incoming-handler
+          config:
+            path: "/admin"

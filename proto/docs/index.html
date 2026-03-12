@@ -240,6 +240,10 @@
                 </li>
               
                 <li>
+                  <a href="#wasmcloud.runtime.v2.Component.InterfaceConfigEntry"><span class="badge">M</span>Component.InterfaceConfigEntry</a>
+                </li>
+              
+                <li>
                   <a href="#wasmcloud.runtime.v2.EmptyDirVolume"><span class="badge">M</span>EmptyDirVolume</a>
                 </li>
               
@@ -249,6 +253,14 @@
               
                 <li>
                   <a href="#wasmcloud.runtime.v2.ImagePullSecret"><span class="badge">M</span>ImagePullSecret</a>
+                </li>
+              
+                <li>
+                  <a href="#wasmcloud.runtime.v2.InterfaceConfig"><span class="badge">M</span>InterfaceConfig</a>
+                </li>
+              
+                <li>
+                  <a href="#wasmcloud.runtime.v2.InterfaceConfig.ConfigEntry"><span class="badge">M</span>InterfaceConfig.ConfigEntry</a>
                 </li>
               
                 <li>
@@ -726,6 +738,46 @@ This information is used by the Runtime Operator to monitor the health of the Wa
                   <td><p>Optional credentials for pulling the image from a private registry </p></td>
                 </tr>
               
+                <tr>
+                  <td>interface_config</td>
+                  <td><a href="#wasmcloud.runtime.v2.Component.InterfaceConfigEntry">Component.InterfaceConfigEntry</a></td>
+                  <td>repeated</td>
+                  <td><p>Per-component configuration keyed by WIT interface identifier.
+Example: { &#34;wasi:http/incoming-handler&#34;: { config: { &#34;path&#34;: &#34;/user/{id}&#34; } } }
+This is the preferred way to provide per-component interface overrides. </p></td>
+                </tr>
+              
+            </tbody>
+          </table>
+
+          
+
+        
+      
+        <h3 id="wasmcloud.runtime.v2.Component.InterfaceConfigEntry">Component.InterfaceConfigEntry</h3>
+        <p></p>
+
+        
+          <table class="field-table">
+            <thead>
+              <tr><td>Field</td><td>Type</td><td>Label</td><td>Description</td></tr>
+            </thead>
+            <tbody>
+              
+                <tr>
+                  <td>key</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p> </p></td>
+                </tr>
+              
+                <tr>
+                  <td>value</td>
+                  <td><a href="#wasmcloud.runtime.v2.InterfaceConfig">InterfaceConfig</a></td>
+                  <td></td>
+                  <td><p> </p></td>
+                </tr>
+              
             </tbody>
           </table>
 
@@ -783,6 +835,61 @@ This information is used by the Runtime Operator to monitor the health of the Wa
               
                 <tr>
                   <td>password</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p> </p></td>
+                </tr>
+              
+            </tbody>
+          </table>
+
+          
+
+        
+      
+        <h3 id="wasmcloud.runtime.v2.InterfaceConfig">InterfaceConfig</h3>
+        <p>Configuration for a specific WIT interface on a component.</p>
+
+        
+          <table class="field-table">
+            <thead>
+              <tr><td>Field</td><td>Type</td><td>Label</td><td>Description</td></tr>
+            </thead>
+            <tbody>
+              
+                <tr>
+                  <td>config</td>
+                  <td><a href="#wasmcloud.runtime.v2.InterfaceConfig.ConfigEntry">InterfaceConfig.ConfigEntry</a></td>
+                  <td>repeated</td>
+                  <td><p> </p></td>
+                </tr>
+              
+            </tbody>
+          </table>
+
+          
+
+        
+      
+        <h3 id="wasmcloud.runtime.v2.InterfaceConfig.ConfigEntry">InterfaceConfig.ConfigEntry</h3>
+        <p></p>
+
+        
+          <table class="field-table">
+            <thead>
+              <tr><td>Field</td><td>Type</td><td>Label</td><td>Description</td></tr>
+            </thead>
+            <tbody>
+              
+                <tr>
+                  <td>key</td>
+                  <td><a href="#string">string</a></td>
+                  <td></td>
+                  <td><p> </p></td>
+                </tr>
+              
+                <tr>
+                  <td>value</td>
                   <td><a href="#string">string</a></td>
                   <td></td>
                   <td><p> </p></td>

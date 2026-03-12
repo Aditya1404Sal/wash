@@ -118,6 +118,7 @@ async fn test_http_counter_with_blobstore_fs_plugin() -> Result<()> {
                     },
                     pool_size: 1,
                     max_invocations: 100,
+                    interface_config: HashMap::new(),
                 },
                 // Component 2: HTTP counter that will use the blobstore
                 Component {
@@ -137,6 +138,7 @@ async fn test_http_counter_with_blobstore_fs_plugin() -> Result<()> {
                     },
                     pool_size: 2,
                     max_invocations: 100,
+                    interface_config: HashMap::new(),
                 },
             ],
             // Host interfaces that the workload needs

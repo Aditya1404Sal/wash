@@ -101,6 +101,7 @@ async fn test_http_counter_integration() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 100,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![
                 WitInterface {
@@ -435,6 +436,7 @@ async fn test_http_counter_error_scenarios() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 50,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![
                 WitInterface {

@@ -203,12 +203,20 @@ func (r *WorkloadReconciler) reconcilePlacement(ctx context.Context, workload *r
 			}
 		}
 
+		protoInterfaceConfig := make(map[string]*runtimev2.InterfaceConfig)
+		for ifaceID, config := range c.InterfaceConfig {
+			protoInterfaceConfig[ifaceID] = &runtimev2.InterfaceConfig{
+				Config: config,
+			}
+		}
+
 		witWorld.Components = append(witWorld.Components, &runtimev2.Component{
 			Image:           c.Image,
 			ImagePullSecret: imagePullSecret,
 			PoolSize:        c.PoolSize,
 			MaxInvocations:  c.MaxInvocations,
 			LocalResources:  localResources,
+			InterfaceConfig: protoInterfaceConfig,
 		})
 	}
 

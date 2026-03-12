@@ -83,6 +83,7 @@ async fn test_blobby_integration() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 100,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![
                 WitInterface {
@@ -284,6 +285,7 @@ async fn test_blobby_error_handling() -> Result<()> {
                 },
                 pool_size: 1,
                 max_invocations: 50,
+                interface_config: HashMap::new(),
             }],
             host_interfaces: vec![
                 WitInterface {

@@ -55,6 +55,9 @@ pub struct WorkloadMetadata {
     local_resources: LocalResources,
     /// The plugins available to this component
     plugins: Option<HashMap<&'static str, Arc<dyn HostPlugin + Send + Sync>>>,
+    /// Per-component configuration keyed by WIT interface identifier.
+    /// Example: `{"wasi:http/incoming-handler": {"path": "/user/{id}"}}`
+    interface_config: HashMap<String, HashMap<String, String>>,
 }
 
 impl WorkloadMetadata {
@@ -240,6 +243,7 @@ impl WorkloadService {
                 volume_mounts,
                 local_resources,
                 plugins: None,
+                interface_config: HashMap::new(),
             },
             handle: None,
             max_restarts,
@@ -279,6 +283,7 @@ pub struct WorkloadComponent {
 impl WorkloadComponent {
     /// Create a new [`WorkloadComponent`] with the given workload ID,
     /// wasmtime [`Component`], [`Linker`], volume mounts, and instance limits.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         workload_id: impl Into<Arc<str>>,
         workload_name: impl Into<Arc<str>>,
@@ -287,6 +292,7 @@ impl WorkloadComponent {
         linker: Linker<Ctx>,
         volume_mounts: Vec<(PathBuf, VolumeMount)>,
         local_resources: LocalResources,
+        interface_config: HashMap<String, HashMap<String, String>>,
     ) -> Self {
         Self {
             metadata: WorkloadMetadata {
@@ -299,6 +305,7 @@ impl WorkloadComponent {
                 volume_mounts,
                 local_resources,
                 plugins: None,
+                interface_config,
             },
             // TODO: Implement pooling and instance limits
             pool_size: 0,
@@ -330,6 +337,20 @@ impl WorkloadComponent {
 
     pub fn metadata(&self) -> &WorkloadMetadata {
         &self.metadata
+    }
+
+    /// Returns the per-component configuration for a specific WIT interface identifier.
+    ///
+    /// # Arguments
+    /// * `interface_id` - The WIT interface identifier, e.g. `"wasi:http/incoming-handler"`
+    pub fn get_interface_config(&self, interface_id: &str) -> Option<HashMap<String, String>> {
+        self.metadata.interface_config.get(interface_id).cloned()
+    }
+
+    /// Returns the HTTP config for this component.
+    /// Shorthand for `get_interface_config("wasi:http/incoming-handler")`.
+    pub fn http_config(&self) -> Option<HashMap<String, String>> {
+        self.get_interface_config("wasi:http/incoming-handler")
     }
 }
 
@@ -493,19 +514,19 @@ impl ResolvedWorkload {
             debug!("Exported instances: {:?}", exported_instances);
 
             for (name, item) in exported_instances {
-                // TODO(#11): It's probably a good idea to skip registering wasi@0.2 interfaces
-                match name.split_once('@') {
-                    Some(("wasmcloud:wash/plugin", _)) => {
-                        trace!(name, "skipping internal plugin export");
-                        continue;
-                    }
-                    None => {
-                        if name == "wasmcloud:wash/plugin" {
-                            trace!(name, "skipping internal plugin export");
-                            continue;
-                        }
-                    }
-                    _ => {}
+                let interface_name = name.split_once('@').map(|(n, _)| n).unwrap_or(&name);
+
+                // Skip internal plugin exports — they are not inter-component links.
+                // Always skip wasi:http exports — they are top-level entry points, not
+                // inter-component dependencies. Even with a single HTTP component, adding
+                // it to the interface map would cause conflicts if another component is
+                // added later. HTTP dispatch is handled by the HTTP handler plugin
+                // (see `HttpServer::on_workload_resolved`).
+                if interface_name == "wasmcloud:wash/plugin"
+                    || interface_name.starts_with("wasi:http/")
+                {
+                    trace!(name, "skipping export from linking");
+                    continue;
                 }
                 if let ComponentItem::ComponentInstance(_) = item {
                     // Register the interface name to the component key
@@ -669,8 +690,8 @@ impl ResolvedWorkload {
 
                     let mut linker_instance = match linker.instance(import_name) {
                         Ok(i) => i,
-                        Err(e) => {
-                            //     warn!(name = import_name, error = %e, "error finding instance in linker, skipping");
+                        Err(_e) => {
+                            //     warn!(name = import_name, error = %_e, "error finding instance in linker, skipping");
                             continue;
                         }
                     };
@@ -719,8 +740,8 @@ impl ResolvedWorkload {
                                             //                    );
                                             // TODO(#103): some kind of store data hashing mechanism
                                             // to detect a diff store to drop the old one
-                                            let import_name = import_name.clone();
-                                            let export_name = export_name.clone();
+                                            let _import_name = import_name.clone();
+                                            let _export_name = export_name.clone();
                                             let pre = pre.clone();
                                             let instance = instance.clone();
                                             Box::new(async move {
@@ -759,8 +780,8 @@ impl ResolvedWorkload {
                                                 //                                "Starting by getting the function from the instance: {}", export_name.clone()
                                                 //                            );
 
-                                                let eng = store.engine().clone();
-                                                let comp = pre.component();
+                                                let _eng = store.engine().clone();
+                                                let _comp = pre.component();
                                                 //                        info!(
                                                 //                            "Exported components: {:?}",
                                                 //                            comp.component_type().exports(&eng).collect::<Vec<_>>()
@@ -849,7 +870,7 @@ impl ResolvedWorkload {
                                     )
                                     .expect("failed to create async func");
                             }
-                            ComponentItem::Resource(resource_ty) => {
+                            ComponentItem::Resource(_resource_ty) => {
                                 let (item, _idx) = match plugin_component
                                     .metadata
                                     .component
@@ -914,10 +935,10 @@ impl ResolvedWorkload {
                         }
                     }
                 }
-                ComponentItem::Resource(resource_ty) => {
+                ComponentItem::Resource(_resource_ty) => {
                     //                  warn!(
                     //                      name = import_name,
-                    //                      ty = ?resource_ty,
+                    //                      ty = ?_resource_ty,
                     //                      "component import is a resource, which is not supported in this context. skipping."
                     //                  );
                 }
@@ -1025,6 +1046,17 @@ impl ResolvedWorkload {
 
     /// Unbind all plugins from all components in this workload.
     ///
+    /// Notifies the HTTP handler that this workload has been resolved.
+    ///
+    /// The HTTP handler will discover HTTP-exporting components internally
+    /// and register them for request routing.
+    async fn notify_http_handler(&self) -> anyhow::Result<()> {
+        self.http_handler
+            .on_workload_resolved(self)
+            .await
+            .context("failed to notify HTTP handler of resolved workload")
+    }
+
     /// This should be called when stopping a workload to ensure proper cleanup
     /// of plugin resources. Errors from individual plugin unbind operations are
     /// logged but do not prevent the overall unbind from completing.
@@ -1035,6 +1067,7 @@ impl ResolvedWorkload {
             "unbinding all plugins from workload"
         );
 
+        let mut http_exports_wasi_http = false;
         for component in self.components.read().await.values() {
             if let Some(plugins) = component.plugins() {
                 for (plugin_id, plugin) in plugins.iter() {
@@ -1070,11 +1103,15 @@ impl ResolvedWorkload {
             }
 
             if component.exports_wasi_http() {
-                self.http_handler
-                    .on_workload_unbind(self.id())
-                    .await
-                    .context("failed to notify HTTP handler of workload")?;
+                http_exports_wasi_http = true;
             }
+        }
+
+        if http_exports_wasi_http {
+            self.http_handler
+                .on_workload_unbind(self.id())
+                .await
+                .context("failed to notify HTTP handler of workload unbind")?;
         }
 
         Ok(())
@@ -1408,22 +1445,11 @@ impl UnresolvedWorkload {
             Vec::new()
         };
 
-        let incoming_http_component = {
-            let http_iface = WitInterface::from("wasi:http/incoming-handler");
-            match self
-                .host_interfaces
-                .iter()
-                .any(|hi| hi.contains(&http_iface))
-            {
-                // http was not part of the requested interfaces
-                false => None,
-                true => self
-                    .components
-                    .values()
-                    .find(|component| component.exports_wasi_http())
-                    .map(|c| c.id().to_string()),
-            }
-        };
+        let http_iface = WitInterface::from("wasi:http/incoming-handler");
+        let workload_requests_http = self
+            .host_interfaces
+            .iter()
+            .any(|hi| hi.contains(&http_iface));
 
         // Resolve the workload
         let mut resolved_workload = ResolvedWorkload {
@@ -1473,16 +1499,7 @@ impl UnresolvedWorkload {
             }
         }
 
-        if let Some(component_id) = incoming_http_component
-            && let Err(e) = http_handler
-                .on_workload_resolved(&resolved_workload, &component_id)
-                .await
-        {
-            warn!(
-                component_id = component_id,
-                error = ?e,
-                "failed to notify HTTP handler of resolved workload, unbinding all plugins"
-            );
+        if workload_requests_http && let Err(e) = resolved_workload.notify_http_handler().await {
             let _ = resolved_workload.unbind_all_plugins().await;
             bail!(e);
         }
@@ -1743,6 +1760,7 @@ mod tests {
             linker,
             Vec::new(),
             local_resources,
+            HashMap::new(),
         )
     }
 

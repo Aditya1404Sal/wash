@@ -28,9 +28,13 @@ use std::{
 use crate::engine::ctx::Ctx;
 use crate::engine::workload::ResolvedWorkload;
 use crate::wit::WitInterface;
-use anyhow::{Context, ensure};
-use hyper::server::conn::http1;
+use anyhow::{Context, Result, ensure};
+use hyper::{
+    server::conn::http1,
+    {Request, body::Incoming},
+};
 use hyper_util::rt::TokioIo;
+use matchit::Router as MatchItRouter;
 use rustls::{ServerConfig, pki_types::CertificateDer};
 use rustls_pemfile::{certs, private_key};
 use tokio::net::TcpListener;
@@ -46,18 +50,24 @@ use wasmtime_wasi_http::{
     body::HyperOutgoingBody,
 };
 
+/// Identifies a specific HTTP handler: a component within a workload.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RouteTarget {
+    pub workload_id: String,
+    pub component_id: String,
+}
+
 /// Trait defining the routing behavior for HTTP requests
 /// Allows for custom routing logic based on workload IDs and requests
 /// Use this trait to implement custom routing strategies with the default HTTP Extension
 #[async_trait::async_trait]
 pub trait Router: Send + Sync + 'static {
-    /// Register a workload that has been resolved
-    /// and is guaranteed to be available for handling requests
+    /// Register a workload and return the route targets that were registered.
+    /// Each router decides which components to route and how.
     async fn on_workload_resolved(
         &self,
         resolved_handle: &ResolvedWorkload,
-        component_id: &str,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<Vec<RouteTarget>>;
 
     /// Unregister a workload that is being stopped
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()>;
@@ -70,17 +80,16 @@ pub trait Router: Send + Sync + 'static {
         config: &wasmtime_wasi_http::types::OutgoingRequestConfig,
     ) -> anyhow::Result<()>;
 
-    /// Pick a workload ID based on the incoming request
     fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
-    ) -> anyhow::Result<String>;
+    ) -> anyhow::Result<RouteTarget>;
 }
 
 /// Router that routes requests by 'Host' header, configured via WitInterface config
 #[derive(Default)]
 pub struct DynamicRouter {
-    host_to_workload: tokio::sync::RwLock<HashMap<String, HashSet<String>>>,
+    host_to_workload: tokio::sync::RwLock<HashMap<String, HashSet<RouteTarget>>>,
     workload_to_host: tokio::sync::RwLock<HashMap<String, String>>,
 }
 
@@ -91,9 +100,7 @@ impl Router for DynamicRouter {
     async fn on_workload_resolved(
         &self,
         resolved_handle: &ResolvedWorkload,
-        _component_id: &str,
-    ) -> anyhow::Result<()> {
-        info!("In workload resolved");
+    ) -> anyhow::Result<Vec<RouteTarget>> {
         let incoming_handler_interface = WitInterface::from("wasi:http/incoming-handler");
         let Some(http_iface) = resolved_handle
             .host_interfaces()
@@ -109,35 +116,44 @@ impl Router for DynamicRouter {
             .cloned()
             .context("No host header found")?;
 
-        info!("ADDED THIS TO HOST_TO_WORKLOAD");
-        info!(
-            "HOST HEADER: {} and ID: {}",
-            host_header,
-            resolved_handle.id().to_string()
-        );
+        let workload_id = resolved_handle.id().to_string();
+
+        let component_id = {
+            let components = resolved_handle.components();
+            let components = components.read().await;
+            components
+                .iter()
+                .find(|(_, c)| c.exports_wasi_http())
+                .map(|(id, _)| id.to_string())
+                .context("no component exports wasi:http/incoming-handler")?
+        };
+
+        let target = RouteTarget {
+            workload_id: workload_id.clone(),
+            component_id,
+        };
 
         {
             let mut lock = self.workload_to_host.write().await;
-            lock.insert(resolved_handle.id().to_string(), host_header.clone());
+            lock.insert(workload_id.clone(), host_header.clone());
         }
 
         {
             let mut lock = self.host_to_workload.write().await;
             let entry = lock.entry(host_header.clone()).or_insert_with(HashSet::new);
-            entry.insert(resolved_handle.id().to_string());
+            entry.insert(target.clone());
         }
-        info!("Out workload resolved");
 
-        Ok(())
+        Ok(vec![target])
     }
 
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
         let mut lock = self.workload_to_host.write().await;
         if let Some(host_header) = lock.remove(workload_id) {
             let mut host_lock = self.host_to_workload.write().await;
-            if let Some(workload_set) = host_lock.get_mut(&host_header) {
-                workload_set.remove(workload_id);
-                if workload_set.is_empty() {
+            if let Some(target_set) = host_lock.get_mut(&host_header) {
+                target_set.retain(|t| t.workload_id != workload_id);
+                if target_set.is_empty() {
                     host_lock.remove(&host_header);
                 }
             }
@@ -154,45 +170,170 @@ impl Router for DynamicRouter {
         Ok(())
     }
 
-    /// Pick a workload ID based on the incoming request
     fn route_incoming_request(
         &self,
         req: &hyper::Request<hyper::body::Incoming>,
-    ) -> anyhow::Result<String> {
-        info!("In route incoming request");
+    ) -> anyhow::Result<RouteTarget> {
         tokio::task::block_in_place(move || {
-            let lock = self.host_to_workload.try_read()?;
-
-            info!("Out route incoming request");
-            info!("Host to workload map, {:?}", lock);
+            let lock = self.host_to_workload.blocking_read();
 
             let workload_host = req
                 .headers()
                 .get(hyper::header::HOST)
                 .and_then(|h| h.to_str().ok())
                 .context("no Host header in request")?;
-            let Some(workload_set) = lock.get(workload_host) else {
-                info!("no workload bound to host header: {}", workload_host);
+            let Some(target_set) = lock.get(workload_host) else {
                 anyhow::bail!("no workload bound to host header: {}", workload_host);
             };
 
-            let workload_id = workload_set
+            let target = target_set
                 .iter()
                 .next()
-                .context("no workload IDs found for host header")?;
+                .context("no route targets found for host header")?;
 
-            info!("Go to workload_id: {}", workload_id.clone());
-
-            info!("Out route incoming request");
-            Ok(workload_id.clone())
+            Ok(target.clone())
         })
     }
 }
+/// Path-based HTTP router that maps URL path patterns to route targets.
+pub struct PathRouter {
+    routes: tokio::sync::RwLock<HashMap<String, RouteTarget>>,
+    router: std::sync::RwLock<MatchItRouter<RouteTarget>>,
+}
 
-/// Development router that routes all requests to the last resolved workload
+impl Default for PathRouter {
+    fn default() -> Self {
+        Self {
+            routes: tokio::sync::RwLock::new(HashMap::new()),
+            router: std::sync::RwLock::new(MatchItRouter::new()),
+        }
+    }
+}
+
+impl PathRouter {
+    async fn rebuild_router(&self) -> Result<()> {
+        let routes = self.routes.read().await;
+        let mut new_router = MatchItRouter::new();
+
+        for (pattern, target) in routes.iter() {
+            new_router
+                .insert(pattern.clone(), target.clone())
+                .with_context(|| {
+                    format!(
+                        "failed to insert route pattern '{}' for workload='{}', component='{}': \
+                         this may be caused by conflicting path patterns (e.g., '/user/{{id}}' and '/user/admin')",
+                        pattern, target.workload_id, target.component_id
+                    )
+                })?;
+        }
+
+        let mut router_guard = self.router.write().map_err(|e| anyhow::anyhow!("{e}"))?;
+        *router_guard = new_router;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Router for PathRouter {
+    async fn on_workload_resolved(
+        &self,
+        resolved_handle: &ResolvedWorkload,
+    ) -> Result<Vec<RouteTarget>> {
+        let incoming_handler_interface = WitInterface::from("wasi:http/incoming-handler");
+        let workload_id = resolved_handle.id().to_string();
+
+        let component_paths: Vec<(String, HashMap<String, String>)> = {
+            let components = resolved_handle.components();
+            let components = components.read().await;
+            components
+                .iter()
+                .filter(|(_, c)| c.exports_wasi_http())
+                .map(|(id, c)| {
+                    let config = c.http_config().unwrap_or_else(|| {
+                        resolved_handle
+                            .host_interfaces()
+                            .iter()
+                            .find(|i| i.contains(&incoming_handler_interface))
+                            .map(|i| i.config.clone())
+                            .unwrap_or_default()
+                    });
+                    (id.to_string(), config)
+                })
+                .collect()
+        };
+
+        let mut registered_targets = Vec::new();
+        for (component_id, http_config) in &component_paths {
+            let Some(path_pattern) = http_config.get("path").cloned() else {
+                tracing::warn!(
+                    workload_id,
+                    component_id,
+                    "no 'path' config found, skipping path-based routing for this component"
+                );
+                continue;
+            };
+
+            let target = RouteTarget {
+                workload_id: workload_id.clone(),
+                component_id: component_id.clone(),
+            };
+
+            {
+                let mut routes = self.routes.write().await;
+                if let Some(existing) = routes.get(&path_pattern) {
+                    anyhow::bail!(
+                        "path pattern '{path_pattern}' is already registered to component '{}' within workload '{}'",
+                        existing.component_id,
+                        existing.workload_id,
+                    );
+                }
+                routes.insert(path_pattern, target.clone());
+            }
+
+            registered_targets.push(target);
+        }
+
+        if !registered_targets.is_empty() {
+            self.rebuild_router().await?;
+        }
+
+        Ok(registered_targets)
+    }
+
+    async fn on_workload_unbind(&self, workload_id: &str) -> Result<()> {
+        {
+            let mut routes = self.routes.write().await;
+            routes.retain(|_, target| target.workload_id != workload_id);
+        }
+
+        self.rebuild_router().await?;
+        Ok(())
+    }
+
+    fn allow_outgoing_request(
+        &self,
+        _workload_id: &str,
+        _request: &hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
+        _config: &wasmtime_wasi_http::types::OutgoingRequestConfig,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn route_incoming_request(&self, req: &Request<Incoming>) -> Result<RouteTarget> {
+        let lock = self.router.read().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let path = req.uri().path();
+
+        match lock.at(path) {
+            Ok(matched) => Ok(matched.value.clone()),
+            Err(_) => anyhow::bail!("no route found for path '{path}'"),
+        }
+    }
+}
+
+/// Development router that routes all requests to the last resolved component
 #[derive(Default)]
 pub struct DevRouter {
-    last_workload_id: tokio::sync::Mutex<Option<String>>,
+    last_target: tokio::sync::Mutex<Option<RouteTarget>>,
 }
 
 #[async_trait::async_trait]
@@ -200,17 +341,32 @@ impl Router for DevRouter {
     async fn on_workload_resolved(
         &self,
         resolved_handle: &ResolvedWorkload,
-        _component_id: &str,
-    ) -> anyhow::Result<()> {
-        let mut lock = self.last_workload_id.lock().await;
-        lock.replace(resolved_handle.id().to_string());
-        Ok(())
+    ) -> anyhow::Result<Vec<RouteTarget>> {
+        let component_id = {
+            let components = resolved_handle.components();
+            let components = components.read().await;
+            components
+                .iter()
+                .filter(|(_, c)| c.exports_wasi_http())
+                .last()
+                .map(|(id, _)| id.to_string())
+                .context("no component exports wasi:http/incoming-handler")?
+        };
+
+        let target = RouteTarget {
+            workload_id: resolved_handle.id().to_string(),
+            component_id,
+        };
+
+        let mut lock = self.last_target.lock().await;
+        lock.replace(target.clone());
+        Ok(vec![target])
     }
 
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
-        let mut lock = self.last_workload_id.lock().await;
-        if let Some(current_id) = &*lock
-            && current_id == workload_id
+        let mut lock = self.last_target.lock().await;
+        if let Some(target) = &*lock
+            && target.workload_id == workload_id
         {
             let _ = lock.take();
         }
@@ -226,14 +382,13 @@ impl Router for DevRouter {
         Ok(())
     }
 
-    /// Pick a workload ID based on the incoming request
     fn route_incoming_request(
         &self,
         _req: &hyper::Request<hyper::body::Incoming>,
-    ) -> anyhow::Result<String> {
-        let lock = self.last_workload_id.try_lock()?;
+    ) -> anyhow::Result<RouteTarget> {
+        let lock = self.last_target.try_lock()?;
         match &*lock {
-            Some(id) => Ok(id.clone()),
+            Some(target) => Ok(target.clone()),
             None => anyhow::bail!("no workload available to route request"),
         }
     }
@@ -247,11 +402,7 @@ pub trait HostHandler: Send + Sync + 'static {
     async fn start(&self) -> anyhow::Result<()>;
     async fn stop(&self) -> anyhow::Result<()>;
 
-    async fn on_workload_resolved(
-        &self,
-        resolved_handle: &ResolvedWorkload,
-        component_id: &str,
-    ) -> anyhow::Result<()>;
+    async fn on_workload_resolved(&self, resolved_handle: &ResolvedWorkload) -> anyhow::Result<()>;
     async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()>;
 
     fn outgoing_request(
@@ -284,7 +435,6 @@ impl HostHandler for NullServer {
     async fn on_workload_resolved(
         &self,
         _resolved_handle: &ResolvedWorkload,
-        _component_id: &str,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -305,9 +455,10 @@ impl HostHandler for NullServer {
     }
 }
 
-/// A map from host header to resolved workload handles and their associated component id
+/// A map from workload_id → { component_id → (ResolvedWorkload, InstancePre) }
+/// Supports multiple HTTP-handling components per workload.
 pub type WorkloadHandles =
-    Arc<RwLock<HashMap<String, (ResolvedWorkload, InstancePre<Ctx>, String)>>>;
+    Arc<RwLock<HashMap<String, HashMap<String, (ResolvedWorkload, InstancePre<Ctx>)>>>>;
 
 /// HTTP server plugin that handles incoming HTTP requests for WebAssembly components.
 ///
@@ -431,25 +582,23 @@ impl<T: Router> HostHandler for HttpServer<T> {
         }
         Ok(())
     }
+    async fn on_workload_resolved(&self, resolved_handle: &ResolvedWorkload) -> anyhow::Result<()> {
+        let targets = self.router.on_workload_resolved(resolved_handle).await?;
 
-    async fn on_workload_resolved(
-        &self,
-        resolved_handle: &ResolvedWorkload,
-        component_id: &str,
-    ) -> anyhow::Result<()> {
-        self.router
-            .on_workload_resolved(resolved_handle, component_id)
-            .await?;
-        let instance_pre = resolved_handle.instantiate_pre(component_id).await?;
-
-        self.workload_handles.write().await.insert(
-            resolved_handle.id().to_string(),
-            (
-                resolved_handle.clone(),
-                instance_pre,
-                component_id.to_string(),
-            ),
-        );
+        for target in &targets {
+            let instance_pre = resolved_handle
+                .instantiate_pre(&target.component_id)
+                .await?;
+            self.workload_handles
+                .write()
+                .await
+                .entry(target.workload_id.clone())
+                .or_default()
+                .insert(
+                    target.component_id.clone(),
+                    (resolved_handle.clone(), instance_pre),
+                );
+        }
 
         Ok(())
     }
@@ -583,7 +732,7 @@ async fn handle_http_request<T: Router>(
     let method = req.method().clone();
     let uri = req.uri().clone();
 
-    let Ok(workload_id) = handler.route_incoming_request(&req) else {
+    let Ok(route_target) = handler.route_incoming_request(&req) else {
         return Ok(hyper::Response::builder()
             .status(400)
             .body(HyperOutgoingBody::default())
@@ -593,35 +742,48 @@ async fn handle_http_request<T: Router>(
     info!(
         method = %method,
         uri = %uri,
-        host = %workload_id,
+        workload = %route_target.workload_id,
+        component = %route_target.component_id,
         "HTTP request received"
     );
 
     // NOTE(lxf): Separate HTTP / GRPC handling
 
-    // Look up workload handle for this host, with wildcard fallback
+    // Look up workload handle for the route target
     let workload_handle = {
         let handles = workload_handles.read().await;
-        info!(host = %workload_id, "looking up workload handle for host header");
-        handles.get(&workload_id).cloned()
+        handles
+            .get(&route_target.workload_id)
+            .and_then(|components| components.get(&route_target.component_id))
+            .cloned()
     };
 
     let response = match workload_handle {
-        Some((handle, instance_pre, component_id)) => {
-            match invoke_component_handler(handle, instance_pre, &component_id, req).await {
+        Some((handle, instance_pre)) => {
+            match invoke_component_handler(handle, instance_pre, &route_target.component_id, req)
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
-                    error!(err = ?e, host = %workload_id, "failed to invoke component");
+                    error!(
+                        err = ?e,
+                        workload = %route_target.workload_id,
+                        component = %route_target.component_id,
+                        "failed to invoke component"
+                    );
                     hyper::Response::builder()
                         .status(500)
                         .body(HyperOutgoingBody::default())
-                        // .body(HyperOutgoingBody::new(e.to_string()))
                         .expect("failed to build 500 response")
                 }
             }
         }
         None => {
-            warn!(host = %workload_id, "No workload bound to host header or wildcard '*'");
+            warn!(
+                workload = %route_target.workload_id,
+                component = %route_target.component_id,
+                "No component handle found for route target"
+            );
             hyper::Response::builder()
                 .status(404)
                 .body(HyperOutgoingBody::default())

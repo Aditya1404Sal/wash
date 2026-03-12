@@ -1,0 +1,38 @@
+# Example: Multi-component path routing within a single workload
+#
+# This workload contains TWO components, each handling a different HTTP path:
+#   - "user" component handles /user/{id} requests
+#   - "admin" component handles /admin requests
+#
+# Per-component interfaceConfig allows each component to declare its own
+# path-based routing config, enabling multiple HTTP-handling components
+# within a single workload.
+apiVersion: runtime.wasmcloud.dev/v1alpha1
+kind: WorkloadDeployment
+metadata:
+  name: multi-component-routing
+spec:
+  replicas: 1
+  template:
+    spec:
+      hostSelector:
+        hostgroup: public-ingress
+        router-mode: path
+      components:
+        - name: user
+          image: ghcr.io/aditya1404sal/components/user:0.1.0
+          interfaceConfig:
+            "wasi:http/incoming-handler":
+              path: "/user/{id}"
+        - name: admin
+          image: ghcr.io/aditya1404sal/components/admin:0.1.0
+          interfaceConfig:
+            "wasi:http/incoming-handler":
+              path: "/admin"
+      # Workload-level hostInterfaces declares that HTTP is needed.
+      # Per-component interfaceConfig above provides the path routing.
+      hostInterfaces:
+        - namespace: wasi
+          package: http
+          interfaces:
+            - incoming-handler

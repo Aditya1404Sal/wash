@@ -90,6 +90,15 @@ message Component {
   sint32 max_invocations = 4;
   // Optional credentials for pulling the image from a private registry
   ImagePullSecret image_pull_secret = 5;
+  // Per-component configuration keyed by WIT interface identifier.
+  // Example: { "wasi:http/incoming-handler": { config: { "path": "/user/{id}" } } }
+  // This is the preferred way to provide per-component interface overrides.
+  map<string, InterfaceConfig> interface_config = 6;
+}
+
+// Configuration for a specific WIT interface on a component.
+message InterfaceConfig {
+  map<string, string> config = 1;
 }
 
 message LocalResources {
