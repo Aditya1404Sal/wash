@@ -25,6 +25,8 @@ use std::{
     sync::Arc,
 };
 
+use super::sse::SseRegistry;
+
 use crate::engine::ctx::Ctx;
 use crate::engine::workload::ResolvedWorkload;
 use crate::wit::WitInterface;
@@ -320,6 +322,7 @@ pub struct HttpServer<T: Router> {
     workload_handles: WorkloadHandles,
     shutdown_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
     tls_acceptor: Option<TlsAcceptor>,
+    sse_registry: Option<Arc<SseRegistry>>,
 }
 
 impl<T: Router> std::fmt::Debug for HttpServer<T> {
@@ -346,7 +349,22 @@ impl<T: Router> HttpServer<T> {
             workload_handles: Arc::default(),
             shutdown_tx: Arc::new(RwLock::new(None)),
             tls_acceptor: None,
+            sse_registry: None,
         }
+    }
+
+    /// Enable SSE connection tracking with the given route pattern.
+    ///
+    /// The pattern uses `{param}` syntax for dynamic segments.
+    /// Example: `/api/record-updates/{model}/{recordId}`
+    pub fn with_sse(mut self, route_pattern: impl Into<Arc<str>>) -> Self {
+        self.sse_registry = Some(Arc::new(SseRegistry::new(route_pattern)));
+        self
+    }
+
+    /// Get a reference to the SSE registry, if SSE is enabled.
+    pub fn sse_registry(&self) -> Option<&Arc<SseRegistry>> {
+        self.sse_registry.as_ref()
     }
 
     /// Creates a new HTTPS server with TLS support.
@@ -379,6 +397,7 @@ impl<T: Router> HttpServer<T> {
             workload_handles: Arc::default(),
             shutdown_tx: Arc::new(RwLock::new(None)),
             tls_acceptor: Some(tls_acceptor),
+            sse_registry: None,
         })
     }
 }
@@ -400,6 +419,7 @@ impl<T: Router> HostHandler for HttpServer<T> {
         // Start the HTTP server, any incoming requests call Host::handle and then it's routed
         // to the workload based on host header.
         let handler = self.router.clone();
+        let sse_registry = self.sse_registry.clone();
         tokio::spawn(async move {
             if let Err(e) = run_http_server(
                 listener,
@@ -407,12 +427,20 @@ impl<T: Router> HostHandler for HttpServer<T> {
                 workload_handles,
                 &mut shutdown_rx,
                 tls_acceptor,
+                sse_registry,
             )
             .await
             {
                 error!(err = ?e, addr = ?addr, "HTTP server error");
             }
         });
+
+        // Spawn SSE keepalive task if SSE is enabled
+        if let Some(ref registry) = self.sse_registry {
+            let registry = Arc::clone(registry);
+            tokio::spawn(async move { registry.run_keepalive().await });
+            info!("SSE keepalive task started (30s interval)");
+        }
 
         let protocol = if self.tls_acceptor.is_some() {
             "HTTPS"
@@ -510,6 +538,7 @@ async fn run_http_server<T: Router>(
     workload_handles: WorkloadHandles,
     shutdown_rx: &mut mpsc::Receiver<()>,
     tls_acceptor: Option<TlsAcceptor>,
+    sse_registry: Option<Arc<SseRegistry>>,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
@@ -527,12 +556,14 @@ async fn run_http_server<T: Router>(
                         let handles_clone = workload_handles.clone();
                         let tls_acceptor_clone = tls_acceptor.clone();
                         let handler_clone = handler.clone();
+                        let sse_clone = sse_registry.clone();
                         tokio::spawn(async move {
                             let service = hyper::service::service_fn(move |req| {
                                 let handles = handles_clone.clone();
                                 let handler = handler_clone.clone();
+                                let sse = sse_clone.clone();
                                 async move {
-                                    handle_http_request(handler, req, handles).await
+                                    handle_http_request(handler, req, handles, sse).await
                                 }
                             });
 
@@ -579,7 +610,16 @@ async fn handle_http_request<T: Router>(
     handler: Arc<T>,
     req: hyper::Request<hyper::body::Incoming>,
     workload_handles: WorkloadHandles,
+    sse_registry: Option<Arc<SseRegistry>>,
 ) -> Result<hyper::Response<HyperOutgoingBody>, hyper::Error> {
+    // SSE requests are handled entirely by the host
+    // The host holds the connection open and components push events via the SseWriter plugin.
+    if let Some(ref registry) = sse_registry {
+        if SseRegistry::is_sse_request(&req) {
+            return registry.handle_sse_request(&req).await;
+        }
+    }
+
     let method = req.method().clone();
     let uri = req.uri().clone();
 
@@ -615,7 +655,6 @@ async fn handle_http_request<T: Router>(
                     hyper::Response::builder()
                         .status(500)
                         .body(HyperOutgoingBody::default())
-                        // .body(HyperOutgoingBody::new(e.to_string()))
                         .expect("failed to build 500 response")
                 }
             }
@@ -628,6 +667,7 @@ async fn handle_http_request<T: Router>(
                 .expect("failed to build 404 response")
         }
     };
+
     Ok(response)
 }
 

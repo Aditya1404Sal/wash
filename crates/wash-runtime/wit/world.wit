@@ -33,3 +33,7 @@ world messaging {
 world smtp{
     import bettyblocks:smtp/client@0.2.0;
 }
+
+world sse-writer {
+    import bettyblocks:sse/handler@0.1.0;
+}

@@ -1,0 +1,6 @@
+package wasmcloud:sse-demo;
+
+world sse-demo {
+    import bettyblocks:sse/handler@0.1.0;
+    export wasi:http/incoming-handler@0.2.0;
+}

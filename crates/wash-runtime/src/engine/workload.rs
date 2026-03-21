@@ -636,7 +636,7 @@ impl ResolvedWorkload {
                         let Some(exporter_component) = interface_map.get(import_name) else {
                             // TODO: error because unsatisfied import, if there's no available
                             // export then it's an unresolvable workload
-                            error!(
+                            trace!(
                                 name = import_name,
                                 "import not found in component exports, skipping"
                             );

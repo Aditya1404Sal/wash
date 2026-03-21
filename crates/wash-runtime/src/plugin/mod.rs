@@ -44,6 +44,8 @@ pub mod wasi_webgpu;
 #[cfg(feature = "wasmcloud-smtp")]
 pub mod smtp;
 
+pub mod sse_writer;
+
 /// The [`HostPlugin`] trait provides an interface for implementing built-in plugins for the host.
 /// A plugin is primarily responsible for implementing a specific [`WitWorld`] as a collection of
 /// imports and exports that will be directly linked to the workload's [`wasmtime::component::Linker`].

@@ -3131,7 +3131,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.2",
  "url",
- "webpki-roots 1.0.2",
+ "webpki-roots 1.0.4",
 ]
 
 [[package]]
@@ -6791,10 +6791,11 @@ dependencies = [
  "futures",
  "gag",
  "hostname",
- "http-body-util",
- "hyper-util",
  "html2text",
+ "http-body",
+ "http-body-util",
  "hyper",
+ "hyper-util",
  "lettre",
  "names",
  "oci-client 0.15.0",
@@ -6819,6 +6820,7 @@ dependencies = [
  "testcontainers",
  "tokio",
  "tokio-rustls 0.26.2",
+ "tokio-stream",
  "tokio-util",
  "tonic",
  "tonic-prost",

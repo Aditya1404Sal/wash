@@ -1,0 +1,15 @@
+package bettyblocks:sse@0.1.0;
+
+interface handler {
+    /// Write an SSE event to an open stream connection.
+    ///
+    /// The data is formatted as `data: {data}\n\n` per the SSE wire format
+    /// and pushed to the client holding the connection open.
+    write-event: func(stream-id: string, data: string) -> result<_, string>;
+
+    /// Check if a stream ID is currently registered (connection is open).
+    is-registered: func(stream-id: string) -> bool;
+
+    /// List all stream IDs for a given scope key (e.g. "sse:scope:chatMessage:323").
+    list-connections: func(scope-key: string) -> list<string>;
+}
